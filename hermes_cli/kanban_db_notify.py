@@ -77,6 +77,7 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    require_exact: bool = False,
 ) -> None:
     """Register a gateway source wanting terminal-state notifications for
     ``task_id``; idempotent on (task, platform, chat, thread).
@@ -88,8 +89,13 @@ def add_notify_sub(
     untouched, an explicit valid value is last-write-wins, unknown falls back
     to ``"notify"``. New subs start caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
+    ``require_exact=True`` rejects a conflicting preserved user/owner identity
+    before any write, instead of letting an exact-binding API report false success.
+    Existing callers retain their original preserve/fill-only upsert semantics.
     """
     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
+    if require_exact and valid_mode is None:
+        raise ValueError("invalid delivery_mode")
     # api_server is stateless: the adapter has no send(), the wake self-post IS
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
@@ -97,6 +103,12 @@ def add_notify_sub(
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        if require_exact:
+            existing = conn.execute("SELECT * FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+            if existing and (existing["user_id"] != user_id or (
+                existing["notifier_profile"] and existing["notifier_profile"] != notifier_profile
+            )):
+                raise ValueError("existing subscription identity differs; native upsert preserves user/owner")
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs

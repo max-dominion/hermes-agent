@@ -24,11 +24,15 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.kanban_db_goal import set_goal_config
+from plugins.kanban.dashboard.task_controls import (
+    GoalConfigBody, NotifySubscriptionBody, SUBSCRIPTION_FIELDS, require_control_write_origin,
+)
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -466,7 +470,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
 
-class UpdateTaskBody(BaseModel):
+class UpdateTaskBody(GoalConfigBody):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -619,9 +623,20 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(task_id: str, payload: UpdateTaskBody, request: Request, board: Optional[str] = Query(None)):
+    goal_fields = {"goal_mode", "goal_max_turns"}
+    wants_goal = bool(payload.model_fields_set & goal_fields)
+    if wants_goal:
+        require_control_write_origin(request)
+        if payload.model_fields_set - goal_fields:
+            raise HTTPException(status_code=400, detail="Send Goal controls in a separate PATCH")
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
+        if wants_goal:
+            with _map_errors(409, RuntimeError), _map_errors(400, ValueError):
+                _require_ok(set_goal_config(
+                    conn, task_id, goal_mode=payload.goal_mode,
+                    goal_max_turns=payload.goal_max_turns, board=board))
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
@@ -1073,6 +1088,39 @@ def get_config():
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True))}
+
+
+# --- Exact origin subscriptions ---------------------------------------------
+
+@router.put("/tasks/{task_id}/notify-subscription")
+def put_notify_subscription(
+    task_id: str, payload: NotifySubscriptionBody, request: Request,
+    board: Optional[str] = Query(None),
+):
+    require_control_write_origin(request)
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        with _map_errors(409, ValueError):
+            kbn.add_notify_sub(conn, task_id=task_id, **payload.model_dump(), require_exact=True)
+        binding = next(s for s in kbn.list_notify_subs(conn, task_id) if (
+            s["platform"], s["chat_id"], s["thread_id"]
+        ) == (payload.platform, payload.chat_id, payload.thread_id or ""))
+        return {"subscription": {k: binding[k] for k in SUBSCRIPTION_FIELDS}}
+
+
+@router.get("/tasks/{task_id}/notify-subscription")
+def get_notify_subscription(
+    task_id: str, platform: str, chat_id: str, thread_id: Optional[str] = None,
+    board: Optional[str] = Query(None),
+):
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        binding = next((s for s in kbn.list_notify_subs(conn, task_id) if (
+            s["platform"], s["chat_id"], s["thread_id"]
+        ) == (platform, chat_id, thread_id or "")), None)
+        if binding is None:
+            raise HTTPException(status_code=404, detail="subscription not found")
+        return {"subscription": {k: binding[k] for k in SUBSCRIPTION_FIELDS}}
 
 
 # --- Home-channel subscriptions (per-task, per-platform toggles) -------------
