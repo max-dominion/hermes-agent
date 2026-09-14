@@ -1135,7 +1135,8 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (PR URL in a recent comment; re-spawning risks a duplicate PR, unless a
+    deliberate unblock acknowledged that evidence for the next claim). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1206,9 +1207,8 @@ def check_respawn_guard(
     # 4. PR evidence is acknowledged only by a native explicit unblock, until
     # the next claim. Automatic promotion/reclaim cannot authorize another run.
     resume_comment_id = 0
-    resume_before = 0
     resume = conn.execute(
-        "SELECT id, payload, created_at FROM task_events WHERE task_id = ? "
+        "SELECT id, payload FROM task_events WHERE task_id = ? "
         "AND kind = 'unblocked' ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     if resume is not None:
@@ -1216,16 +1216,11 @@ def check_respawn_guard(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' "
             "AND id > ? LIMIT 1", (task_id, resume["id"]),
         ).fetchone()
-        payload = _kb._json_dict(resume["payload"])
-        watermark = payload.get("resume_comment_id")
-        if not claimed_since:
-            if "resume_comment_id" not in payload:
-                # Legacy events have no ID watermark. Keep same-second PRs
-                # guarded; timestamp order must not be converted to ID order.
-                resume_before = int(resume["created_at"])
-            elif type(watermark) is int and watermark > 0:
-                resume_comment_id = watermark
-    pr_cutoff = max(now - _RESPAWN_GUARD_PR_WINDOW, resume_before)
+        watermark = _kb._json_dict(resume["payload"]).get("resume_comment_id")
+        # Older events have no safe cross-table ordering receipt; fail closed.
+        if not claimed_since and type(watermark) is int and watermark > 0:
+            resume_comment_id = watermark
+    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? AND id > ?",

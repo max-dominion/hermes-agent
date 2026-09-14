@@ -85,7 +85,7 @@ def test_resume_keeps_auth_cooldown_dispatch_and_legacy_fences(board, monkeypatc
         assert kb.unblock_task(conn, tid)
         assert kbd.check_respawn_guard(conn, tid) == 'rate_limit_cooldown'
 
-        for delta, expected in [(1, None), (0, 'active_pr')]:
+        for delta, expected in [(1, 'active_pr'), (0, 'active_pr')]:
             legacy = kb.create_task(conn, title='legacy resume', assignee='default')
             monkeypatch.setattr(kb.time, 'time', lambda: 1800000100)
             kb.add_comment(conn, legacy, author='worker', body='https://github.com/a/b/pull/3')
