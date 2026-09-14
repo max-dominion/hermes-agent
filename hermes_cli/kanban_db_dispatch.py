@@ -1203,11 +1203,33 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    # 4. PR evidence is acknowledged only by a native explicit unblock, until
+    # the next claim. Automatic promotion/reclaim cannot authorize another run.
+    resume_comment_id = 0
+    resume_before = 0
+    resume = conn.execute(
+        "SELECT id, payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'unblocked' ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if resume is not None:
+        claimed_since = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+            "AND id > ? LIMIT 1", (task_id, resume["id"]),
+        ).fetchone()
+        payload = _kb._json_dict(resume["payload"])
+        watermark = payload.get("resume_comment_id")
+        if not claimed_since:
+            if "resume_comment_id" not in payload:
+                # Legacy events have no ID watermark. Keep same-second PRs
+                # guarded; timestamp order must not be converted to ID order.
+                resume_before = int(resume["created_at"])
+            elif type(watermark) is int and watermark > 0:
+                resume_comment_id = watermark
+    pr_cutoff = max(now - _RESPAWN_GUARD_PR_WINDOW, resume_before)
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
+        "SELECT body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? AND id > ?",
+        (task_id, pr_cutoff, resume_comment_id),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"

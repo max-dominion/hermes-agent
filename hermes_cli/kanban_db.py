@@ -3281,14 +3281,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        # A deliberate unblock acknowledges existing PR evidence, not future
+        # comments. Capture the exact watermark under the same write lock.
+        comment_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        payload = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready" else {}
         )
+        if comment_id:
+            payload["resume_comment_id"] = comment_id
+        _append_event(conn, task_id, "unblocked", payload or None)
         return True
 
 
