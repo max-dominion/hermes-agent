@@ -994,6 +994,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1017,6 +1018,14 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None:
+            run = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (expected_run_id, task_id),
+            ).fetchone()
+            if (row["current_run_id"] != expected_run_id or row["status"] != "running"
+                    or run is None or run["ended_at"] is not None):
+                return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

@@ -1,7 +1,7 @@
-"""Turn-end guard for kanban workers, which must end with ``kanban_complete`` or
-``kanban_block``. Some models narrate the next step and stop with no tool calls;
-Hermes treats that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
-Policy-only: return a bounded synthetic nudge so the loop continues instead of exiting.
+"""Terminal-only stop guard for classic Kanban workers.
+
+An actual native Goal loop owner may accept a checkpoint response instead; it
+still owns judging, bounded continuation and the terminal board transition.
 """
 
 from __future__ import annotations
@@ -50,9 +50,12 @@ def build_kanban_stop_nudge(
     attempts: int = 0,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     task_id: Optional[str] = None,
+    goal_loop_active: bool = False,
 ) -> Optional[str]:
-    """Synthetic follow-up when a kanban worker exits without a terminal tool; ``None`` when
-    the guard should not fire (not a kanban worker, already completed/blocked, budget exhausted)."""
+    """Nudge classic workers, but yield checkpoints to an actual Goal loop owner."""
+    if goal_loop_active:
+        return None
+
     if (
         not kanban_stop_nudge_enabled()
         or attempts >= max_attempts

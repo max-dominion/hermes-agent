@@ -3997,56 +3997,6 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
-    """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
-
-    The caller swallows all errors: a broken loop must never wedge a worker.
-    """
-    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
-        return
-    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
-    worker_run_id = _int_or(raw_run_id, None) if raw_run_id else None
-    if raw_run_id and worker_run_id is None:
-        logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
-
-    from hermes_cli import kanban_db as _kb
-    from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
-
-    # Goal text = title + body (the acceptance criteria the judge evaluates against).
-    with _kbc.connect_closing() as conn:
-        task = _kb.get_task(conn, task_id)
-    if task is None:
-        return
-
-    goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
-    if not goal_text:
-        return
-
-    def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
-        _sync_cli_session_id_from_agent(cli)
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
-        if resp:
-            print(resp)
-        return resp or ""
-
-    def _task_status() -> "str | None":
-        with _kbc.connect_closing() as c:
-            return _kb.goal_run_status(c, task_id, worker_run_id)
-
-    def _block(reason: str) -> None:
-        with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
-
-    _run_loop(
-        task_id=task_id, goal_text=goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
-        max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
-    )
-
-
 def _sync_cli_session_id_from_agent(cli) -> None:
     """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session."""
     if getattr(cli.agent, "session_id", None) and cli.agent.session_id != cli.session_id:
@@ -4055,8 +4005,13 @@ def _sync_cli_session_id_from_agent(cli) -> None:
 
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code."""
+    goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
     try:
-        result = cli.agent.run_conversation(user_message=effective_query, conversation_history=cli.conversation_history)
+        if goal_mode:
+            from hermes_cli.kanban_goal_worker import run_goal_query
+            result = run_goal_query(cli, effective_query)
+        else:
+            result = cli.agent.run_conversation(user_message=effective_query, conversation_history=cli.conversation_history)
     except KeyboardInterrupt:
         _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -4072,16 +4027,8 @@ def _run_quiet_single_query(cli, effective_query):
         and (result.get("failed") or result.get("partial"))
     ):
         print(f"Error: {result['error']}", file=sys.stderr)
-    elif response:
+    elif response and not goal_mode:
         print(response)
-
-    # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
-    # done, the worker terminates it, or the turn budget runs out (sticky block).
-    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
-        try:
-            _run_kanban_goal_loop_q(cli, response)
-        except Exception as _goal_exc:
-            logger.debug("kanban goal loop failed: %s", _goal_exc)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 

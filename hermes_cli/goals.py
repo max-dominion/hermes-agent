@@ -1551,8 +1551,11 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "is genuinely finished, call kanban_complete with a summary. If it is a "
     "code change that needs same-card review before counting as done, call "
     "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
-    "calling one of them."
+    "need human input, call kanban_block with a reason. While useful work remains, "
+    "you may end this turn with an evidence-backed progress checkpoint before the "
+    "inner iteration cap; the native Goal loop will judge and continue in this "
+    "same worker. A checkpoint is not task completion or permission to bypass "
+    "review, consent, cancellation, or budgets. Do not block just to checkpoint."
 )
 
 # Judge says done but the worker never called kanban_complete/kanban_block: one explicit nudge.
@@ -1620,7 +1623,7 @@ def run_kanban_goal_loop(
     turns_used = 1   # the first turn already consumed one unit of budget
     nudged_to_finalize = False
 
-    while True:
+    def stopped_result():
         try:
             status = task_status_fn()
         except Exception as exc:
@@ -1637,7 +1640,18 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
+        return None
+
+    while True:
+        stopped = stopped_result()
+        if stopped is not None:
+            return stopped
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        # Judging is a remote call; a cancellation or successor claim can win
+        # while it is in flight. Never act on that now-stale verdict.
+        stopped = stopped_result()
+        if stopped is not None:
+            return stopped
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
