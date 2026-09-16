@@ -42,6 +42,8 @@ def finish(tid, rid, status):
     ("done", 2, "done", 0), ("review", 2, "review", 0), ("blocked", 2, "blocked", 0),
     ("budget", 3, "blocked", 0), ("judge_done", 2, "blocked", 0),
     ("cancel_during_judge", 1, "blocked", 0),
+    ("archive_during_judge", 1, "archived", 0),
+    ("interrupt_during_judge", 1, "running", 0),
     ("failed_first", 1, "running", 1), ("failed_second", 2, "running", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
     ("inner_budget", 1, "ready", 0),
     ("exception_second", 2, "running", 1),
@@ -86,6 +88,11 @@ def test_goal_checkpoint_lifecycle(claimed, monkeypatch, case, expected_calls, e
         return result
 
     def judge(*args, **kwargs):
+        if case == "archive_during_judge":
+            with kbc.connect_closing() as conn:
+                assert kb.archive_task(conn, tid)
+        if case == "interrupt_during_judge":
+            agent._interrupt_requested = True
         if case == "cancel_during_judge":
             finish(tid, rid, "blocked")
             return "blocked", "stale verdict", False, None, False

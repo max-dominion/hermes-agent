@@ -25,9 +25,9 @@ slice), not after it. No model-compliance guarantee is implied.
 
 ## Evidence
 
-- Canonical runner, 90 relevant Kanban/Goal/budget/CLI/tool files: 741 passed,
-  zero failed, nine platform/optional skips before the final multipart/exception
-  additions. Final focused integration: 21 passed, zero failed.
+- Canonical runner, 90 relevant Kanban/Goal/budget/CLI/tool files: 745 passed,
+  zero failed, nine platform/optional skips. The 23 new integration checks include
+  multipart/exception behavior and archive/interrupt during judging.
 - Real AIAgent + quiet CLI over deterministic loopback HTTP, temporary board:
   two turns, two model calls, same session, retained history, stable system prefix.
   Both plain and multipart query inputs are exercised. Only transport responses
