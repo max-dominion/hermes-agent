@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import queue
@@ -51,6 +52,15 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+
+    @functools.cached_property
+    def _system_notices_on(self) -> bool:
+        """``display[.platforms.<p>].system_notices`` for this turn's platform (read once per turn)."""
+        from gateway.display_config import resolve_display_setting
+        from gateway.run import _platform_config_key
+        ctx = self._ctx
+        return bool(resolve_display_setting(
+            ctx.user_config or {}, _platform_config_key(ctx.source.platform), "system_notices", True))
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -153,6 +163,8 @@ class TurnRunner:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
         status = kwargs.get("status")
+        if not self._system_notices_on:
+            return
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
@@ -820,6 +832,8 @@ class TurnRunner:
         if not self._status_live():
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        if prepared is not None and not self._system_notices_on:
+            prepared = None
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",
@@ -1077,7 +1091,7 @@ class TurnRunner:
         """Credits / out-of-band notices (usage bands, depletion, restored) fire from the agent's
         sync worker thread; hop onto the gateway loop. Fired-once latch lives on the cached agent."""
         from gateway.run import render_notice_line
-        if not self._status_live():
+        if not self._status_live() or not self._system_notices_on:
             return
         try:
             line = render_notice_line(notice)
@@ -1175,11 +1189,12 @@ class TurnRunner:
                 pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
-        # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
-        if isinstance(mem_notif, bool):
-            mem_notif = "on" if mem_notif else "off"
-        agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+        # display[.platforms.<plat>].memory_notifications: off | on (generic "💾 Memory updated") | verbose.
+        from gateway.display_config import resolve_display_setting
+        from gateway.run import _platform_config_key
+        agent.memory_notifications = resolve_display_setting(
+            ctx.user_config, _platform_config_key(ctx.source.platform), "memory_notifications", "on",
+        ) if self._system_notices_on else "off"
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
@@ -1718,7 +1733,8 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": [],
+                    "gateway_authored": True}
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
@@ -1772,7 +1788,7 @@ class TurnRunner:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": final_response, **common}
+            return {"final_response": final_response, "gateway_authored": bool(final_response), **common}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.

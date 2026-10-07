@@ -143,7 +143,8 @@ _PERSISTENCE_DEFAULT_EXPLANATION = (
 
 
 def _display_flag_enabled(agent, *, env_var: str, config_key: str, cache_attr: str) -> bool:
-    """``display.<config_key>`` (default True), cached per agent on ``cache_attr``.
+    """``display.platforms.<agent.platform>.<config_key>`` → ``display.<config_key>`` (default True),
+    cached per agent on ``cache_attr``.
 
     ``env_var`` overrides on every call and is never cached. Reads the persisted config.yaml
     so gateway and CLI share the setting; ``load_config`` is imported lazily (startup cycle,
@@ -160,11 +161,9 @@ def _display_flag_enabled(agent, *, env_var: str, config_key: str, cache_attr: s
             _cfg = _load_config() or {}
         except Exception:
             _cfg = {}
-        _display = _cfg.get("display") if isinstance(_cfg, dict) else None
-        if isinstance(_display, dict) and config_key in _display:
-            enabled = bool(_display.get(config_key))
-        else:
-            enabled = True
+        from gateway.display_config import resolve_display_setting
+        platform_key = getattr(agent, "platform", None) or "cli"
+        enabled = bool(resolve_display_setting(_cfg if isinstance(_cfg, dict) else {}, platform_key, config_key, True))
         setattr(agent, cache_attr, enabled)
         return enabled
     except Exception:

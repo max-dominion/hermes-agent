@@ -30,7 +30,21 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
     "live_status": "full",
+    # Agent-turn notices that also apply outside the gateway; per-platform so customer-facing
+    # inboxes (iMessage) can mute them while operator surfaces keep them.
+    "memory_notifications": "on",  # "off" (review still runs) | "on" | "verbose"
+    "file_mutation_verifier": True,  # failed write_file/patch footer on the final reply (still logged when off)
+    "turn_completion_explainer": True,  # "⚠️ No reply: ..." text when a turn ends without an answer
+    # Gateway-authored chat lines that are not the agent's reply: status/retry lines, credit and
+    # subagent-failure notices, stall/auto-reset notices, busy/queue/drain acks, voice-transcript
+    # echoes, background-process notices, "♻️ Recovered reply" markers. False = only the agent speaks.
+    "system_notices": True,
+    # False replaces gateway-authored error text (provider failures, "/reset" hints) with
+    # NEUTRAL_ERROR_REPLY, for chats with people who should not see the machinery.
+    "error_detail": True,
 }
+
+NEUTRAL_ERROR_REPLY = "Sorry, something went wrong on my end. Please try again in a moment."
 
 # Tiers: HIGH = editing, personal/team use; MEDIUM = editing but customer-facing;
 # LOW = no edit support (progress messages are permanent); MINIMAL = batch delivery.
@@ -161,6 +175,11 @@ _NORMALISERS: dict[str, Any] = {
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
     "tool_preview_length": _norm_int,
+    "memory_notifications": _norm_tristate("on", "off", {"off", "on", "verbose"}),
+    "file_mutation_verifier": _norm_bool,
+    "turn_completion_explainer": _norm_bool,
+    "system_notices": _norm_bool,
+    "error_detail": _norm_bool,
 }
 
 

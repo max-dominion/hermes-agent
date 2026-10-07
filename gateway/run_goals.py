@@ -204,7 +204,7 @@ class GatewayGoalsMixin:
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self._goal_notice_adapter(source)
-        if not adapter:
+        if not adapter or not self._system_notices_enabled(getattr(source, "platform", None)):
             return
         metadata = None
         with suppress(Exception):

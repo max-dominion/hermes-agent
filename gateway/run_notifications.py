@@ -104,7 +104,7 @@ class GatewayNotificationsMixin:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         from gateway.run import _is_slack_ignored_channel
         adapter = self._adapter_for_source(source)
-        if not adapter:
+        if not adapter or not self._system_notices_enabled(getattr(source, "platform", None)):
             return
         config = getattr(self, "config", None)
         chat_id = getattr(source, "chat_id", None)
@@ -1489,6 +1489,8 @@ class GatewayNotificationsMixin:
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
+        if not self._system_notices_enabled(platform_name):
+            return
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:

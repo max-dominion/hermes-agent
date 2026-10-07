@@ -1403,6 +1403,8 @@ class GatewayInboundMixin:
         self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
     ) -> None:
         """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
+        if not self._system_notices_enabled(source.platform):
+            return
         for tx in transcripts:
             try:
                 await adapter.send(source.chat_id, f'🎙️ "{tx}"', metadata=metadata)

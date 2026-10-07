@@ -786,8 +786,9 @@ DEFAULT_CONFIG = {
         # is always full).
         "reasoning_full": False,
         # Background self-improvement notices in chat: "off" (review still runs) | "on" (generic "💾
-        # Memory updated") | "verbose" (content preview). Per-platform via
-        # display.platforms.<platform>.memory_notifications.
+        # Memory updated") | "verbose" (content preview). Per-platform in the gateway via
+        # display.platforms.<platform>.memory_notifications (also file_mutation_verifier,
+        # turn_completion_explainer, system_notices, error_detail — see gateway/display_config.py).
         "memory_notifications": "on",
         # Gateway notices when a terminal(background=true) process finishes: "concise" (one line;
         # failures append an output tail) | "all" (running updates + final raw output) | "result"

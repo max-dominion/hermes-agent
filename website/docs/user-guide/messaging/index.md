@@ -812,6 +812,26 @@ display:
 
 Defaults to `false`. Only platforms whose adapter implements `delete_message` honor the setting (currently Telegram and Discord). Failed runs **skip** cleanup so the bubbles remain as breadcrumbs.
 
+### Customer-facing chats: only the agent speaks
+
+When outside people text a line (an iMessage number, a support WhatsApp), Hermes' own notices read as noise or leak machinery. These per-platform settings mute them without changing operator surfaces:
+
+```yaml
+display:
+  platforms:
+    photon:
+      memory_notifications: off        # "💾 Self-improvement review" lines (the review still runs)
+      file_mutation_verifier: false    # failed-write footer on the reply (still logged as a warning)
+      turn_completion_explainer: false # "⚠️ No reply: ..." explanation text
+      system_notices: false            # every other gateway-authored line: status/retry, credits,
+                                       # subagent failures, stall/auto-reset, busy/queue/drain acks,
+                                       # voice-transcript echoes, background-process and kanban pings,
+                                       # "♻️ Recovered reply" markers
+      error_detail: false              # provider/gateway error text → one neutral apology line
+```
+
+Restart notices use the existing `platforms.<name>.gateway_restart_notification: false`.
+
 ## Next Steps
 
 - [Telegram Setup](telegram.md)

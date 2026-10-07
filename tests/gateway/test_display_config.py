@@ -1,6 +1,8 @@
 """Tests for gateway.display_config — per-platform display/verbosity resolver."""
 
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Resolver: resolution order
 # ---------------------------------------------------------------------------
@@ -327,3 +329,26 @@ class TestLiveStatusSetting:
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
 
+
+
+class TestPerPlatformNoticeMuting:
+    """A customer-facing inbox can mute Hermes' own notices without touching operator surfaces."""
+
+    @pytest.mark.parametrize("setting,muted", [
+        ("memory_notifications", "off"),
+        ("file_mutation_verifier", False),
+        ("turn_completion_explainer", False),
+        ("system_notices", False),
+        ("error_detail", False),
+    ])
+    def test_photon_override_mutes_only_photon(self, setting, muted):
+        from gateway.display_config import resolve_display_setting
+
+        base = {"display": {"platforms": {"discord": {"tool_progress": "off"}}}}
+        # YAML 1.1 turns a bare ``off`` into False; both spellings must mute.
+        for raw in ("off", False):
+            muted_cfg = {"display": {"platforms": {"discord": {"tool_progress": "off"}, "photon": {setting: raw}}}}
+            assert resolve_display_setting(muted_cfg, "photon", setting) == muted
+            for other in ("discord", "telegram", "slack", "cli"):
+                assert resolve_display_setting(muted_cfg, other, setting) == resolve_display_setting(base, other, setting)
+        assert resolve_display_setting(base, "photon", setting) != muted

@@ -364,6 +364,30 @@ class TestVerifierEnabled:
         )
         assert agent._file_mutation_verifier_enabled() is False
 
+    def test_platform_override_mutes_footer_but_keeps_log(self, monkeypatch, caplog):
+        """display.platforms.<p>.file_mutation_verifier mutes the chat footer on that platform only;
+        the failed-write check still reaches the log."""
+        import logging
+        import hermes_cli.config as _cfg_mod
+        from agent.turn_finalizer import _append_file_mutation_footer
+
+        monkeypatch.delenv("HERMES_FILE_MUTATION_VERIFIER", raising=False)
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
+            "display": {"file_mutation_verifier": True, "platforms": {"photon": {"file_mutation_verifier": False}}},
+        })
+        failed = {"/tmp/x.py": {"tool": "patch", "error_preview": "Could not find old_string"}}
+        replies = {}
+        for platform in ("photon", "discord"):
+            agent = _bare_agent()
+            agent.platform = platform
+            agent._turn_failed_file_mutations = dict(failed)
+            log = logging.getLogger(f"test.verifier.{platform}")
+            with caplog.at_level(logging.WARNING, logger=log.name):
+                replies[platform] = _append_file_mutation_footer(agent, "Done.", log)
+        assert replies["photon"] == "Done."
+        assert replies["discord"].startswith("Done.") and replies["discord"] != "Done."
+        assert any("/tmp/x.py" in r.getMessage() for r in caplog.records if r.name == "test.verifier.photon")
+
 
 
 

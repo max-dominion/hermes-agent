@@ -410,7 +410,8 @@ class GatewayBusySessionMixin:
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
         else:
             message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-        await self._send_busy_reply(event, adapter, message)
+        if self._system_notices_enabled(event.source.platform):
+            await self._send_busy_reply(event, adapter, message)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
     _PLAINTEXT_APPROVAL_WORDS: Dict[str, tuple] = {
@@ -647,6 +648,8 @@ class GatewayBusySessionMixin:
         return message
 
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
+        if not self._system_notices_enabled(event.source.platform):
+            return
         try:
             await self._send_busy_reply(event, adapter, message)
         except Exception as e:

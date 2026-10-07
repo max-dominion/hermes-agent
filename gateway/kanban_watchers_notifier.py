@@ -564,8 +564,8 @@ class _KanbanNotification:
                     "on wake self-post instead", self.platform_str, self.task_id,
                 )
                 continue
-            if not self.send_passive:
-                # Wake-only: the wake path is the sole delivery and resolves the counter.
+            if not self.send_passive or not self.runner._system_notices_enabled(self.plat):
+                # Wake-only (or a muted surface): the wake path is the sole delivery and resolves the counter.
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue

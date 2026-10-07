@@ -157,6 +157,9 @@ class GatewaySessionWatchersMixin:
             activity.get("provenance") or activity.get("last_activity_provenance") or "unknown",
         )
         source = getattr(pending_event, "source", None)
+        if source is not None and not self._system_notices_enabled(getattr(source, "platform", None)):
+            notified_map[session_key] = True  # muted surface: latch like an undeliverable notice
+            return False
         if not getattr(source, "chat_id", None):
             logger.warning("Session stall notify skipped (no chat_id): session=%s", session_key)
             notified_map[session_key] = True  # cannot deliver; latch to avoid log spam every tick

@@ -379,7 +379,7 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             content = row["content"]
-            if row.get("needs_marker"):
+            if row.get("needs_marker") and self._system_notices_enabled(row.get("platform")):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:

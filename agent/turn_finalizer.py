@@ -354,6 +354,9 @@ def _append_file_mutation_footer(agent, final_response, logger):
             footer = agent._format_file_mutation_failure_footer(_failed)
             if footer:
                 final_response = final_response.rstrip() + "\n\n" + footer
+        elif _failed:  # footer muted for this surface; keep the check visible to operators
+            logger.warning("file-mutation verifier (footer muted): %d failed write(s) never superseded: %s",
+                           len(_failed), ", ".join(sorted(_failed)[:10]))
     except Exception as _ver_err:
         logger.debug("file-mutation verifier footer failed: %s", _ver_err)
     return final_response

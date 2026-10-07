@@ -380,6 +380,28 @@ class GatewayConfigLoadersMixin:
         return DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT
 
     @staticmethod
+    def _platform_display_flag(platform: Any, setting: str) -> bool:
+        """Boolean per-platform display setting (``display.platforms.<p>.<setting>`` → global → default)."""
+        from gateway.display_config import resolve_display_setting
+        from gateway.run import _load_gateway_config, _platform_config_key
+        try:
+            key = _platform_config_key(platform if isinstance(platform, Platform) else Platform(str(platform)))
+        except (TypeError, ValueError):
+            return True
+        return bool(resolve_display_setting(_load_gateway_config(), key, setting, True))
+
+    def _system_notices_enabled(self, platform: Any) -> bool:
+        """``display.system_notices`` for *platform*; False keeps gateway-authored notices out of the chat."""
+        enabled = self._platform_display_flag(platform, "system_notices")
+        if not enabled:
+            logger.debug("system notice suppressed for platform %s", getattr(platform, "value", platform))
+        return enabled
+
+    def _error_detail_enabled(self, platform: Any) -> bool:
+        """``display.error_detail`` for *platform*; False swaps gateway error text for a neutral line."""
+        return self._platform_display_flag(platform, "error_detail")
+
+    @staticmethod
     def _load_background_notifications_mode() -> str:
         """Background process notification mode from env/config (default ``concise``)."""
         from gateway.run import _load_gateway_runtime_config

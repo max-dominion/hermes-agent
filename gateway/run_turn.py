@@ -406,7 +406,7 @@ class GatewayTurnMixin:
         turn_sidecar_notes.append(context_note)
 
         try:
-            should_notify = reset_reason == "suspended"
+            should_notify = reset_reason == "suspended" and self._system_notices_enabled(source.platform)
             adapter = self._adapter_for_source(source) if should_notify else None
             if adapter:
                 notice = (
@@ -1384,6 +1384,12 @@ class GatewayTurnMixin:
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
+            if response and not self._error_detail_enabled(source.platform) and self._is_gateway_authored_reply(
+                agent_result, response,
+            ):
+                from gateway.display_config import NEUTRAL_ERROR_REPLY
+                logger.info("error_detail off for %s: replaced gateway error text: %.200s", _platform_name, response)
+                response = NEUTRAL_ERROR_REPLY
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
@@ -1746,6 +1752,16 @@ class GatewayTurnMixin:
 
         return response
 
+    @staticmethod
+    def _is_gateway_authored_reply(agent_result: dict, response: str) -> bool:
+        """True when *response* is gateway/loop error text rather than the model's own answer."""
+        from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn, _looks_like_gateway_provider_error
+        raw = str(agent_result.get("final_response") or "").strip()
+        return bool(
+            agent_result.get("gateway_authored") or agent_result.get("failed") or raw in ("", "(empty)")
+            or _is_gateway_hidden_reasoning_incomplete_turn(agent_result) or _looks_like_gateway_provider_error(raw)
+        )
+
     _STATUS_HINTS = {
         401: " Check your API key or run `claude /login` to refresh OAuth credentials.",
         402: " Your API balance or quota is exhausted. Check your provider dashboard.",
@@ -1770,6 +1786,9 @@ class GatewayTurnMixin:
                     )
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+        if not self._error_detail_enabled(source.platform):
+            from gateway.display_config import NEUTRAL_ERROR_REPLY
+            return NEUTRAL_ERROR_REPLY
         # Never expose raw exception types/messages to end users (info-leakage risk).
         status_code = getattr(e, "status_code", None)
         status_hint = self._STATUS_HINTS.get(status_code, "")
