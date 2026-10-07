@@ -172,6 +172,14 @@ globalThis[HEARTBEAT_HOOK] = () => {
   staleness.lastHeartbeatAt = Date.now();
   staleness.heartbeatCount += 1;
   staleness.zombieSuspected = false;
+  // A heartbeat is proof the subscription is live: on a quiet line it is the
+  // only signal that clears "starting"/"recovering" (interrupt counts would
+  // otherwise accumulate across days until a message arrives). It never
+  // clears "degraded": heartbeats from one healthy member stream must not mask
+  // another member that is persistently failing.
+  if (streamHealth.state === "starting" || streamHealth.state === "recovering") {
+    markStreamHealthy();
+  }
 };
 
 // Liveness = the latest message yield OR server heartbeat. Without heartbeats
