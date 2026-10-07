@@ -208,8 +208,16 @@ deliberate:
    are tied to that build's output. `npm install` runs it via `postinstall` and
    fails loudly if the anchors no longer match — update them to the new output
    (`test_spectrum_patch.py` covers the patch).
-5. Run `pytest tests/plugins/platforms/photon/`.
-6. Verify end-to-end: `hermes photon status`, a DM and a group roundtrip,
+5. Re-validate `sidecar/patch-spectrum-heartbeat.mjs`. spectrum-ts never passes
+   `onHeartbeat` to `createGrpcClient`, so Photon's ~30 s server heartbeat frames
+   are dropped and a quiet line looks dead; the patch injects `onHeartbeat` next to
+   each `autoIdempotency: true,` anchor. Drop it once upstream wires heartbeats
+   (`test_auth_recovery.py` covers it). Also re-check the client-rebuild premise in
+   `sidecar/auth-recovery.mjs`: if the SDK learns to replace its client set on a
+   plan change (shared <-> dedicated), the in-place rebuild becomes a safety net
+   rather than the fix.
+6. Run `pytest tests/plugins/platforms/photon/`.
+7. Verify end-to-end: `hermes photon status`, a DM and a group roundtrip,
    and an agent reply into a group right after a gateway restart (exercises
    `space.get` rehydration).
 

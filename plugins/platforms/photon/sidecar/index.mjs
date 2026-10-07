@@ -17,7 +17,10 @@
 // Protocol (all requests require `X-Hermes-Sidecar-Token: ${TOKEN}`):
 //   - GET  /inbound    -> 200 NDJSON stream; one JSON event per line, blank
 //                         lines are heartbeats. One consumer at a time.
-//   - POST /healthz     -> {"ok": true}
+//   - POST /healthz     -> {"ok": true, "stream": {...}, "auth": {...}}
+//   - POST /rebuild     -> {"ok": true, "rebuilt": bool, "auth": {...}}
+//       Rebuilds the Spectrum client in place (fresh token, current line
+//       set). Used by the health watchdog as its first repair step.
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
 //              "format": "text" | "markdown" (default "text")}
@@ -66,12 +69,21 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import {
+  HEARTBEAT_HOOK,
+  patchSpectrumHeartbeat,
+} from "./patch-spectrum-heartbeat.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
   shouldProbe,
   isZombieSuspect,
 } from "./stream-staleness.mjs";
+import {
+  isAuthFailure,
+  isModeDrift,
+  rebuildAllowed,
+} from "./auth-recovery.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -114,6 +126,20 @@ const STREAM_PROBE_COOLDOWN_MS =
 const STREAM_PROBE_TIMEOUT_MS =
   Number(process.env.PHOTON_STREAM_PROBE_TIMEOUT_MS) || 10 * 1000;
 const STREAM_WATCHDOG_TICK_MS = 30 * 1000;
+// Once the server's ~30 s heartbeat frames have been seen, silence means the
+// stream itself stopped, so a much shorter threshold is safe.
+const HEARTBEAT_SILENCE_PROBE_MS =
+  Number(process.env.PHOTON_HEARTBEAT_SILENCE_PROBE_MS) || 2 * 60 * 1000;
+// Auth canary: periodically confirm the live Spectrum client still holds a
+// valid token and was built for the project's current iMessage mode.
+const AUTH_CANARY_MS = (() => {
+  const raw = Number(process.env.PHOTON_AUTH_CANARY_MS);
+  return Number.isFinite(raw) ? raw : 5 * 60 * 1000;
+})();
+const REBUILD_MIN_INTERVAL_MS =
+  Number(process.env.PHOTON_REBUILD_MIN_INTERVAL_MS) || 60 * 1000;
+const SPECTRUM_CLOUD_URL =
+  process.env.SPECTRUM_CLOUD_URL || "https://spectrum.photon.codes";
 
 const streamHealth = {
   state: "starting",
@@ -128,8 +154,10 @@ let streamRestartTimer = null;
 // Zombie-watchdog runtime state (see stream-staleness.mjs for the rules).
 const staleness = {
   lastInboundAt: Date.now(),
+  lastHeartbeatAt: 0,
+  heartbeatCount: 0,
   lastProbeAt: 0,
-  lastProbeOutcome: null, // "alive" | "inconclusive" | null
+  lastProbeOutcome: null, // "alive" | "inconclusive" | "auth_failed" | null
   zombieSuspected: false,
 };
 
@@ -138,11 +166,37 @@ function noteInboundYield() {
   staleness.zombieSuspected = false;
 }
 
+// Installed before spectrum-ts loads; the heartbeat patch calls it for every
+// server heartbeat frame on any subscribe stream.
+globalThis[HEARTBEAT_HOOK] = () => {
+  staleness.lastHeartbeatAt = Date.now();
+  staleness.heartbeatCount += 1;
+  staleness.zombieSuspected = false;
+};
+
+// Liveness = the latest message yield OR server heartbeat. Without heartbeats
+// (patch missing) this degrades to the old message-only behaviour.
+function lastStreamSignalAt() {
+  return Math.max(staleness.lastInboundAt, staleness.lastHeartbeatAt);
+}
+
+function effectiveSilenceThresholdMs() {
+  if (!(STREAM_SILENCE_PROBE_MS > 0)) return STREAM_SILENCE_PROBE_MS;
+  return staleness.heartbeatCount > 0
+    ? Math.min(HEARTBEAT_SILENCE_PROBE_MS, STREAM_SILENCE_PROBE_MS)
+    : STREAM_SILENCE_PROBE_MS;
+}
+
 function stalenessSnapshot(now) {
   return {
     lastInboundAt: new Date(staleness.lastInboundAt).toISOString(),
-    silentForMs: now - staleness.lastInboundAt,
-    silenceThresholdMs: STREAM_SILENCE_PROBE_MS,
+    lastHeartbeatAt:
+      staleness.lastHeartbeatAt > 0
+        ? new Date(staleness.lastHeartbeatAt).toISOString()
+        : null,
+    heartbeatCount: staleness.heartbeatCount,
+    silentForMs: now - lastStreamSignalAt(),
+    silenceThresholdMs: effectiveSilenceThresholdMs(),
     lastProbeAt:
       staleness.lastProbeAt > 0
         ? new Date(staleness.lastProbeAt).toISOString()
@@ -166,6 +220,31 @@ function streamHealthSnapshot() {
     lastIssue: streamHealth.lastIssue,
     issueCount: streamHealth.issueCount,
     staleness: stalenessSnapshot(now),
+  };
+}
+
+// In-process client recovery state (see auth-recovery.mjs for why).
+const authHealth = {
+  generation: 0,
+  builtAt: null,
+  builtMode: null, // "shared" | "dedicated" | null (unknown)
+  currentMode: null,
+  lastCanaryAt: null,
+  lastCanaryOutcome: null, // "ok" | "auth_failed" | "mode_drift" | "inconclusive"
+  lastCanaryDetail: null,
+  rebuilds: 0,
+  lastRebuildAt: null,
+  lastRebuildReason: null,
+  lastRebuildError: null,
+  lastAuthFailureAt: null,
+};
+
+function authHealthSnapshot() {
+  return {
+    ok:
+      authHealth.lastCanaryOutcome !== "auth_failed" &&
+      authHealth.lastCanaryOutcome !== "mode_drift",
+    ...authHealth,
   };
 }
 
@@ -228,8 +307,16 @@ function markStreamRecovering(reason) {
 
 function classifyStreamLog(text) {
   if (!text.includes("[spectrum.stream]")) return;
+  // The retired client's streams keep logging failures until it stops; they
+  // say nothing about the replacement client.
+  if (Date.now() < rebuildGraceUntil) return;
   const reason = text.split("\n", 1)[0];
   if (text.includes("persistently failing")) {
+    // A stream failing on auth is fixable in-process: rebuild the client
+    // (fresh token + current line set) before the degraded->exit path fires.
+    if (isAuthFailure(text)) {
+      scheduleRebuild("inbound stream persistently failing on auth");
+    }
     markStreamDegraded(reason);
   } else if (text.includes("stream interrupted")) {
     markStreamRecovering(reason);
@@ -297,6 +384,20 @@ try {
       (e && e.stack ? e.stack : String(e))
   );
 }
+// Optional: without it the zombie watchdog falls back to message-only
+// liveness (slower to detect a dead stream, prone to quiet-line restarts).
+try {
+  const hb = patchSpectrumHeartbeat();
+  if (hb.patched) {
+    console.error(`photon-sidecar: spectrum heartbeat patch applied: ${hb.file}`);
+  }
+} catch (e) {
+  console.error(
+    "photon-sidecar: spectrum heartbeat patch failed; stream liveness falls " +
+      "back to message traffic only. Original error: " +
+      (e && e.stack ? e.stack : String(e))
+  );
+}
 let Spectrum,
   imessage,
   attachment,
@@ -328,12 +429,43 @@ try {
   process.exit(3);
 }
 
-const app = await Spectrum({
-  projectId,
-  projectSecret,
-  providers: [imessage.config()],
-  options: { flattenGroups: true },
-  telemetry,
+async function createSpectrumApp() {
+  return await Spectrum({
+    projectId,
+    projectSecret,
+    providers: [imessage.config()],
+    options: { flattenGroups: true },
+    telemetry,
+  });
+}
+
+// The project's current iMessage mode ("shared" pool vs "dedicated" lines),
+// straight from Spectrum cloud. Null when unknown (network error, test stub):
+// unknown never triggers a rebuild on its own.
+async function fetchImessageMode() {
+  try {
+    const res = await fetch(`${SPECTRUM_CLOUD_URL}/projects/${projectId}/imessage/`, {
+      headers: {
+        Authorization: "Basic " + Buffer.from(`${projectId}:${projectSecret}`).toString("base64"),
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const type = body?.data?.type;
+    return type === "shared" || type === "dedicated" ? type : null;
+  } catch {
+    return null;
+  }
+}
+
+// `app` is reassigned by rebuildClient(); every use reads the live binding.
+let app = await createSpectrumApp();
+authHealth.generation = 1;
+authHealth.builtAt = new Date().toISOString();
+fetchImessageMode().then((mode) => {
+  authHealth.builtMode = mode;
+  authHealth.currentMode = mode;
 });
 
 // Effect-name → native effect id map. Optional chaining: an SDK build
@@ -713,56 +845,192 @@ function inboundStreamErrorMessage(e) {
 // iterator itself throws or ends, this consumer would stop forever. Wrap it in
 // a re-subscribe loop with capped exponential backoff + jitter so inbound
 // always recovers (the adapter dedupes any catch-up replay).
-(async () => {
-  let backoff = 1000;
-  for (;;) {
-    try {
-      for await (const [space, message] of app.messages) {
-        backoff = 1000; // healthy traffic — reset
-        markStreamHealthy();
-        // Every yield — any direction — proves the inbound stream is live.
-        noteInboundYield();
-        // Only forward inbound messages (ignore our own outbound echoes).
-        if (message && message.direction && message.direction !== "inbound") {
-          continue;
+//
+// Each Spectrum app gets its own consumer generation. On a client rebuild the
+// new app's consumer starts BEFORE the old app is stopped, so the two streams
+// overlap briefly instead of leaving a gap (the adapter dedupes by message
+// id). A superseded consumer exits as soon as its stream ends.
+let inboundGeneration = 0;
+
+function startInbound(appRef) {
+  const gen = ++inboundGeneration;
+  (async () => {
+    let backoff = 1000;
+    while (gen === inboundGeneration) {
+      try {
+        for await (const [space, message] of appRef.messages) {
+          const current = gen === inboundGeneration;
+          if (current) {
+            backoff = 1000; // healthy traffic — reset
+            markStreamHealthy();
+            // Every yield — any direction — proves the inbound stream is live.
+            noteInboundYield();
+          }
+          // Only forward inbound messages (ignore our own outbound echoes).
+          if (message && message.direction && message.direction !== "inbound") {
+            continue;
+          }
+          // A superseded consumer still delivers what it already pulled, but
+          // must not cache spaces bound to the retired client.
+          if (current) {
+            rememberInboundSpace(space, message);
+            rememberKnownMessage(message);
+          }
+          const event = await normalizeEvent(space, message);
+          if (!event) continue;
+          await deliver(JSON.stringify(event));
+          await acknowledgeInboundRead(message);
         }
-        rememberInboundSpace(space, message);
-        rememberKnownMessage(message);
-        const event = await normalizeEvent(space, message);
-        if (!event) continue;
-        await deliver(JSON.stringify(event));
-        await acknowledgeInboundRead(message);
+        if (gen !== inboundGeneration) break;
+        console.error("photon-sidecar: inbound stream ended — re-subscribing");
+        markStreamRecovering("inbound stream ended");
+      } catch (e) {
+        if (gen !== inboundGeneration) break;
+        const reason = e && e.message ? e.message : String(e);
+        console.error(inboundStreamErrorMessage(e));
+        markStreamRecovering(reason);
+        if (isAuthFailure(e)) scheduleRebuild("inbound stream auth failure: " + reason);
       }
-      console.error("photon-sidecar: inbound stream ended — re-subscribing");
-      markStreamRecovering("inbound stream ended");
-    } catch (e) {
-      const reason = e && e.message ? e.message : String(e);
-      console.error(inboundStreamErrorMessage(e));
-      markStreamRecovering(reason);
+      await new Promise((r) =>
+        setTimeout(r, backoff + Math.random() * backoff * 0.2)
+      );
+      backoff = Math.min(backoff * 2, 30000);
     }
-    await new Promise((r) =>
-      setTimeout(r, backoff + Math.random() * backoff * 0.2)
+  })();
+}
+
+startInbound(app);
+
+// ---------------------------------------------------------------------------
+// In-process client recovery (see auth-recovery.mjs for the upstream gaps).
+//
+// A rebuild constructs a fresh Spectrum app — fresh token mint, current line
+// set — swaps it in, starts its inbound consumer, then stops the old app.
+// Callers: send-path auth failures (retry once), the inbound stream failing on
+// auth, the auth canary (bad token or plan-mode drift) and the zombie
+// watchdog. Rate-limited so a persistent upstream fault can't loop.
+
+var rebuildPromise = null;
+var lastRebuildAtMs = 0;
+var rebuildGraceUntil = 0;
+const REBUILD_LOG_GRACE_MS = 15 * 1000;
+
+async function rebuildClient(reason) {
+  if (rebuildPromise) return await rebuildPromise;
+  const now = Date.now();
+  if (!rebuildAllowed(now, lastRebuildAtMs, REBUILD_MIN_INTERVAL_MS)) {
+    console.error(
+      `photon-sidecar: client rebuild skipped (rate limited; last ${now - lastRebuildAtMs}ms ago): ${reason}`
     );
-    backoff = Math.min(backoff * 2, 30000);
+    return false;
   }
-})();
+  lastRebuildAtMs = now;
+  rebuildPromise = (async () => {
+    console.error(`photon-sidecar: rebuilding Spectrum client — ${reason}`);
+    let fresh;
+    try {
+      fresh = await createSpectrumApp();
+    } catch (e) {
+      authHealth.lastRebuildError = e && e.message ? e.message : String(e);
+      console.error(
+        "photon-sidecar: client rebuild failed; keeping the current client: " +
+          authHealth.lastRebuildError
+      );
+      return false;
+    }
+    const old = app;
+    app = fresh;
+    rebuildGraceUntil = Date.now() + REBUILD_LOG_GRACE_MS;
+    // The fresh client replaces whatever the old one degraded; if it fails
+    // too, its own stream logs degrade it again after the grace window.
+    markStreamHealthy();
+    // Cached spaces/messages/reaction handles hold the retired client.
+    knownSpaces.clear();
+    knownMessages.clear();
+    reactionHandles.clear();
+    startInbound(fresh);
+    noteInboundYield(); // fresh stream: full silence window before probing
+    authHealth.generation += 1;
+    authHealth.rebuilds += 1;
+    authHealth.lastRebuildAt = new Date().toISOString();
+    authHealth.lastRebuildReason = reason;
+    authHealth.lastRebuildError = null;
+    authHealth.builtAt = authHealth.lastRebuildAt;
+    const mode = await fetchImessageMode();
+    if (mode) {
+      authHealth.builtMode = mode;
+      authHealth.currentMode = mode;
+    }
+    authHealth.lastCanaryOutcome = null;
+    console.error(
+      `photon-sidecar: Spectrum client rebuilt (generation ${authHealth.generation}, mode ${mode || "unknown"})`
+    );
+    // Let the new stream subscribe before the old one closes (overlap, not
+    // gap) — unless the old client is auth-broken, in which case its streams
+    // carry nothing and only add noise. Stop it off the request path.
+    const overlapMs = /auth|token|mode changed/i.test(reason) ? 0 : 5000;
+    setTimeout(() => {
+      Promise.race([
+        old.stop(),
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]).catch((e) =>
+        console.error("photon-sidecar: retired client stop failed: " + String(e))
+      );
+    }, overlapMs).unref();
+    return true;
+  })();
+  try {
+    return await rebuildPromise;
+  } finally {
+    rebuildPromise = null;
+  }
+}
+
+function scheduleRebuild(reason) {
+  rebuildClient(reason).catch((e) =>
+    console.error("photon-sidecar: scheduled rebuild threw: " + String(e))
+  );
+}
+
+// Run an upstream operation; on an auth/line-set failure rebuild the client
+// and retry exactly once. Auth rejections happen before the server acts, so a
+// single retry cannot double-send.
+async function withAuthRetry(what, fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (!isAuthFailure(e)) throw e;
+    authHealth.lastAuthFailureAt = new Date().toISOString();
+    console.error(
+      `photon-sidecar: ${what} hit an auth failure (${e && e.message ? e.message : e}); ` +
+        "rebuilding client and retrying once"
+    );
+    const rebuilt = await rebuildClient(`${what} auth failure`);
+    if (!rebuilt) throw e;
+    return await fn();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Zombie-stream watchdog: detect a half-open gRPC stream the SDK can't see.
 //
 // The inbound iterator above can hang forever on a half-open socket — no
 // error, no end — so the re-subscribe loop never fires and classifyStreamLog
-// never sees a "[spectrum.stream]" line. We track the iterator's last yield
-// (noteInboundYield) and, once it has been silent past
-// STREAM_SILENCE_PROBE_MS, drive a cheap unary read (space.getMessage on a
-// synthetic id) over the same authenticated channel. Decision rules (see
+// never sees a "[spectrum.stream]" line. We track the stream's last signal —
+// a message yield OR a server heartbeat frame (patch-spectrum-heartbeat.mjs;
+// Photon sends one every ~30 s) — and, once it has been silent past the
+// threshold, drive a cheap unary read (space.getMessage on a synthetic id)
+// over the same authenticated channel. Decision rules (see
 // stream-staleness.mjs):
 //   probe proves connectivity while the stream is silent -> the stream itself
-//     is the dead part -> markStreamDegraded -> existing exit-75 restart path.
+//     is dead -> rebuild the client in-process; if that fails,
+//     markStreamDegraded -> existing exit-75 restart path.
+//   probe rejected on auth -> stale credentials/line set -> rebuild.
 //   probe inconclusive (rejected/hung) -> do NOTHING: the network may just be
 //     down, and in that case the iterator eventually throws and the
-//     re-subscribe loop recovers on its own. Never restart on silence alone —
-//     shared lines can be legitimately quiet for hours.
+//     re-subscribe loop recovers on its own. Never restart on silence alone.
+// With heartbeats flowing, a quiet line is never silent, so the old
+// every-10-minutes false positive on quiet lines cannot happen.
 
 async function probeUpstream() {
   if (typeof app?.stop !== "function") {
@@ -787,6 +1055,14 @@ async function probeUpstream() {
       // round-trip: the channel is alive.
       return { alive: true, hung: false, reason: "round-trip completed" };
     } catch (e) {
+      if (isAuthFailure(e)) {
+        return {
+          alive: false,
+          hung: false,
+          authFailed: true,
+          reason: e && e.message ? e.message : String(e),
+        };
+      }
       const verdict = classifyProbeRejection(e);
       return { alive: verdict.alive, hung: false, reason: verdict.reason };
     }
@@ -794,7 +1070,11 @@ async function probeUpstream() {
   const outcome = await Promise.race([attempt, timeout]);
   if (timer) clearTimeout(timer);
   staleness.lastProbeAt = Date.now();
-  staleness.lastProbeOutcome = outcome.alive ? "alive" : "inconclusive";
+  staleness.lastProbeOutcome = outcome.alive
+    ? "alive"
+    : outcome.authFailed
+      ? "auth_failed"
+      : "inconclusive";
   return outcome;
 }
 
@@ -802,11 +1082,12 @@ let watchdogProbeInFlight = false;
 async function zombieWatchdogTick() {
   if (watchdogProbeInFlight) return;
   const now = Date.now();
-  const silentForMs = now - staleness.lastInboundAt;
+  const silentForMs = now - lastStreamSignalAt();
+  const thresholdMs = effectiveSilenceThresholdMs();
   if (
     !shouldProbe(
       silentForMs,
-      STREAM_SILENCE_PROBE_MS,
+      thresholdMs,
       now - staleness.lastProbeAt,
       STREAM_PROBE_COOLDOWN_MS
     )
@@ -816,13 +1097,16 @@ async function zombieWatchdogTick() {
   watchdogProbeInFlight = true;
   try {
     const outcome = await probeUpstream();
-    if (isZombieSuspect(silentForMs, STREAM_SILENCE_PROBE_MS, outcome)) {
+    if (outcome.authFailed) {
+      await rebuildClient("watchdog probe auth failure: " + outcome.reason);
+    } else if (isZombieSuspect(silentForMs, thresholdMs, outcome)) {
       staleness.zombieSuspected = true;
       const reason =
-        `inbound stream silent for ${silentForMs}ms while an upstream probe ` +
-        "succeeded — half-open (zombie) gRPC stream suspected";
+        `inbound stream silent for ${silentForMs}ms (no messages or heartbeats) ` +
+        "while an upstream probe succeeded — half-open (zombie) gRPC stream suspected";
       console.error("photon-sidecar: " + reason);
-      markStreamDegraded(reason);
+      const rebuilt = await rebuildClient(reason);
+      if (!rebuilt) markStreamDegraded(reason);
     }
     // Inconclusive: deliberately no action (see block comment above).
   } catch (e) {
@@ -838,6 +1122,64 @@ async function zombieWatchdogTick() {
 if (STREAM_SILENCE_PROBE_MS > 0) {
   const watchdogTimer = setInterval(zombieWatchdogTick, STREAM_WATCHDOG_TICK_MS);
   watchdogTimer.unref();
+}
+
+// ---------------------------------------------------------------------------
+// Auth canary: catch a stale client before a send or an inbound reply hits it.
+// Each tick (1) compares the project's current iMessage mode with the mode the
+// live client was built for — a plan change (shared <-> dedicated) is exactly
+// what strands spectrum-ts' client set — and (2) runs the read-only probe,
+// which fails with an auth error when the live token is bad.
+let canaryInFlight = false;
+async function authCanaryTick() {
+  if (canaryInFlight || rebuildPromise) return;
+  canaryInFlight = true;
+  try {
+    authHealth.lastCanaryAt = new Date().toISOString();
+    const mode = await fetchImessageMode();
+    if (mode) authHealth.currentMode = mode;
+    if (authHealth.builtMode === null && mode) authHealth.builtMode = mode;
+    if (isModeDrift(authHealth.builtMode, mode)) {
+      authHealth.lastCanaryOutcome = "mode_drift";
+      authHealth.lastCanaryDetail = `client built for ${authHealth.builtMode}, project is now ${mode}`;
+      console.error("photon-sidecar: auth canary: " + authHealth.lastCanaryDetail);
+      await rebuildClient("project iMessage mode changed: " + authHealth.lastCanaryDetail);
+      return;
+    }
+    const outcome = await probeUpstream();
+    if (outcome.alive) {
+      authHealth.lastCanaryOutcome = "ok";
+      authHealth.lastCanaryDetail = null;
+    } else if (outcome.authFailed) {
+      authHealth.lastCanaryOutcome = "auth_failed";
+      authHealth.lastCanaryDetail = outcome.reason;
+      authHealth.lastAuthFailureAt = authHealth.lastCanaryAt;
+      console.error("photon-sidecar: auth canary: probe rejected on auth: " + outcome.reason);
+      const rebuilt = await rebuildClient("auth canary probe rejected: " + outcome.reason);
+      if (rebuilt) {
+        const after = await probeUpstream();
+        authHealth.lastCanaryOutcome = after.alive
+          ? "ok"
+          : after.authFailed
+            ? "auth_failed"
+            : "inconclusive";
+        authHealth.lastCanaryDetail = after.alive ? null : after.reason;
+      }
+    } else {
+      authHealth.lastCanaryOutcome = "inconclusive";
+      authHealth.lastCanaryDetail = outcome.reason;
+    }
+  } catch (e) {
+    authHealth.lastCanaryOutcome = "inconclusive";
+    authHealth.lastCanaryDetail = e && e.message ? e.message : String(e);
+  } finally {
+    canaryInFlight = false;
+  }
+}
+
+if (AUTH_CANARY_MS > 0) {
+  const canaryTimer = setInterval(authCanaryTick, AUTH_CANARY_MS);
+  canaryTimer.unref();
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +1328,7 @@ async function resolveSpace(spaceId) {
   const im = imessage(app);
   const phoneTarget = phoneTargetFromSpaceId(spaceId);
   let space = null;
+  const failures = [];
 
   // A bare E.164 phone number addresses a DM, so callers can pass just
   // "+1..." (e.g. PHOTON_HOME_CHANNEL for cron delivery) instead of an opaque
@@ -996,6 +1339,7 @@ async function resolveSpace(spaceId) {
     try {
       space = await im.space.create(phoneTarget);
     } catch (e) {
+      failures.push(e);
       console.error(
         "photon-sidecar: phone->DM space.create failed: " +
           (e && e.stack ? e.stack : String(e))
@@ -1009,13 +1353,20 @@ async function resolveSpace(spaceId) {
     try {
       space = await im.space.get(spaceId);
     } catch (e) {
+      failures.push(e);
       console.error(
         "photon-sidecar: space.get failed: " +
           (e && e.stack ? e.stack : String(e))
       );
     }
   }
-  if (!space) throw new Error(`unable to resolve space id ${spaceId}`);
+  if (!space) {
+    // Keep the auth failure as the cause so withAuthRetry can recognise it.
+    const authCause = failures.find((e) => isAuthFailure(e));
+    throw new Error(`unable to resolve space id ${spaceId}`, {
+      cause: authCause ?? failures[0],
+    });
+  }
 
   rememberKnownSpace(spaceId, space);
   if (phoneTarget) rememberKnownSpace(phoneTarget, space);
@@ -1055,7 +1406,13 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (req.url === "/healthz") {
-      return ok(res, { stream: streamHealthSnapshot() });
+      return ok(res, { stream: streamHealthSnapshot(), auth: authHealthSnapshot() });
+    }
+    if (req.url === "/rebuild") {
+      // Operator / health-watchdog repair: rebuild the Spectrum client in
+      // place (fresh token, current line set) without restarting the gateway.
+      const rebuilt = await rebuildClient("operator /rebuild request");
+      return ok(res, { rebuilt, auth: authHealthSnapshot() });
     }
     if (req.url === "/probe") {
       // Upstream liveness probe. Drives a cheap unary read over the SAME gRPC
@@ -1073,7 +1430,7 @@ const server = http.createServer(async (req, res) => {
         JSON.stringify({
           ok: false,
           alive: false,
-          outcome: outcome.hung ? "hung" : "inconclusive",
+          outcome: outcome.hung ? "hung" : outcome.authFailed ? "auth_failed" : "inconclusive",
           reason: outcome.reason,
         })
       );
@@ -1092,7 +1449,6 @@ const server = http.createServer(async (req, res) => {
       if (format !== "text" && format !== "markdown") {
         return badRequest(res, "format must be text or markdown");
       }
-      const space = await resolveSpace(spaceId);
       // iMessage renders markdown natively; spectrum-ts degrades it to
       // readable plain text on platforms that don't.
       // spectrumMarkdown() enables enableDataDetection in the underlying
@@ -1105,7 +1461,9 @@ const server = http.createServer(async (req, res) => {
         chooseSendFormat(format, text) === "markdown"
           ? spectrumMarkdown(text)
           : spectrumText(text);
-      const result = await space.send(builder);
+      const result = await withAuthRetry("send", async () =>
+        (await resolveSpace(spaceId)).send(builder)
+      );
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-richlink") {
@@ -1113,8 +1471,9 @@ const server = http.createServer(async (req, res) => {
       if (!spaceId || !isHttpUrl(url)) {
         return badRequest(res, "spaceId and http(s) url are required");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(spectrumRichlink(url.trim()));
+      const result = await withAuthRetry("send-richlink", async () =>
+        (await resolveSpace(spaceId)).send(spectrumRichlink(url.trim()))
+      );
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
@@ -1123,8 +1482,6 @@ const server = http.createServer(async (req, res) => {
       if (!spaceId || typeof path !== "string" || !path) {
         return badRequest(res, "spaceId and path are required");
       }
-      const space = await resolveSpace(spaceId);
-
       // spectrum-ts infers name + MIME from the file extension; pass
       // overrides only when Hermes supplied them so a known-good
       // inference isn't clobbered with an empty string.
@@ -1136,7 +1493,11 @@ const server = http.createServer(async (req, res) => {
           ? voice(path, Object.keys(opts).length ? opts : undefined)
           : attachment(path, Object.keys(opts).length ? opts : undefined);
 
-      const result = await space.send(builder);
+      let space = null;
+      const result = await withAuthRetry("send-attachment", async () => {
+        space = await resolveSpace(spaceId);
+        return await space.send(builder);
+      });
 
       // iMessage delivers the caption as a separate bubble; send it
       // after the media so the attachment renders first.
@@ -1157,13 +1518,17 @@ const server = http.createServer(async (req, res) => {
       if (!spaceId || !messageId || typeof emoji !== "string" || !emoji) {
         return badRequest(res, "spaceId, messageId and emoji are required");
       }
-      const space = await resolveSpace(spaceId);
-      const target =
-        knownMessages.get(messageId) ?? (await space.getMessage(messageId));
-      if (!target) {
+      const reacted = await withAuthRetry("react", async () => {
+        const space = await resolveSpace(spaceId);
+        const target =
+          knownMessages.get(messageId) ?? (await space.getMessage(messageId));
+        if (!target) return { missing: true };
+        return { handle: await target.react(emoji) };
+      });
+      if (reacted.missing) {
         return badRequest(res, "message not found");
       }
-      const handle = await target.react(emoji);
+      const handle = reacted.handle;
       if (!handle) {
         return badRequest(res, "reactions not supported on this platform");
       }
@@ -1221,8 +1586,9 @@ const server = http.createServer(async (req, res) => {
       if (choices.length < 2) {
         return badRequest(res, "options must contain at least two choices");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(spectrumPoll(title.trim(), choices));
+      const result = await withAuthRetry("send-poll", async () =>
+        (await resolveSpace(spaceId)).send(spectrumPoll(title.trim(), choices))
+      );
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-effect") {
@@ -1235,9 +1601,10 @@ const server = http.createServer(async (req, res) => {
       if (!effectId) {
         return badRequest(res, "unsupported effect");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(
-        imessageEffect(spectrumText(text.trim()), effectId)
+      const result = await withAuthRetry("send-effect", async () =>
+        (await resolveSpace(spaceId)).send(
+          imessageEffect(spectrumText(text.trim()), effectId)
+        )
       );
       return ok(res, { messageId: result?.id || null });
     }
@@ -1247,8 +1614,9 @@ const server = http.createServer(async (req, res) => {
       if (state !== "start" && state !== "stop") {
         return badRequest(res, "state must be start or stop");
       }
-      const space = await resolveSpace(spaceId);
-      await space.send(spectrumTyping(state));
+      await withAuthRetry("typing", async () =>
+        (await resolveSpace(spaceId)).send(spectrumTyping(state))
+      );
       return ok(res, {});
     }
     res.statusCode = 404;
