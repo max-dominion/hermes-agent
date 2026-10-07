@@ -515,6 +515,28 @@ function reactionTargetText(target) {
     : text;
 }
 
+// Quote for an iMessage threaded reply's target. The iMessage provider
+// rebuilds the full target Message (content may itself be a reply — unwrap
+// it); spectrum's generic deserializer gives `{type: "text", text:
+// contentPreview}`; an unresolvable target is a `custom` stub → null.
+// Attachment/voice targets get a short label so the agent knows what was
+// quoted instead of losing the reply context entirely.
+function replyTargetText(target) {
+  let t = target;
+  for (let depth = 0; depth < 3; depth++) {
+    const c = t && typeof t === "object" ? t.content : null;
+    if (!c || typeof c !== "object" || c.type !== "reply") break;
+    t = { content: c.content };
+  }
+  const text = reactionTargetText(t);
+  if (text) return text;
+  const c = t && typeof t === "object" ? t.content : null;
+  if (c && (c.type === "attachment" || c.type === "voice")) {
+    return `(${c.type}${c.name ? `: ${c.name}` : ""})`;
+  }
+  return null;
+}
+
 async function normalizeContent(content) {
   if (!content || typeof content !== "object") {
     return { type: "unknown" };
@@ -569,6 +591,22 @@ async function normalizeContent(content) {
       // Text of the reacted-to message, so Python can correlate the tapback to
       // the gateway's reply_to_text. Null for attachment/voice-only targets.
       targetText: reactionTargetText(target),
+    };
+  }
+  // iMessage threaded reply ("Reply" on a specific bubble): the user's actual
+  // message is the wrapped `content` (text, attachment, voice, group, ...).
+  // Normalize it recursively so media bytes still inline, and pass the target
+  // so Python can fill the gateway's reply_to_message_id / reply_to_text.
+  if (content.type === "reply") {
+    const target = content.target;
+    return {
+      type: "reply",
+      content: await normalizeContent(content.content),
+      targetMessageId: target?.id ?? null,
+      // Rebuilt iMessage targets carry direction; generic stubs may not.
+      // Python falls back to its own sent-id cache.
+      targetDirection: target?.direction ?? null,
+      targetText: replyTargetText(target),
     };
   }
   // A user tapping a poll choice arrives as `poll_option` carrying the chosen

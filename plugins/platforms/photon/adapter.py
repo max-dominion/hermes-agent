@@ -409,6 +409,13 @@ def _normalize_group_content(content: Dict[str, Any]) -> _Normalized:
             text_parts.append(item_content.get("text") or "")
         elif item_type == "richlink":
             text_parts.append(_format_richlink_content(item_content))
+        elif item_type == "reply":
+            item_text, item_mtype, item_urls, item_types = _normalize_reply_content(item_content)
+            if mtype == MessageType.TEXT:
+                mtype = item_mtype
+            media_urls.extend(item_urls)
+            media_types.extend(item_types)
+            text_parts.append(item_text)
         elif item_type:
             text_parts.append(f"[Photon content type not handled: {item_type}]")
     if media_urls and mtype == MessageType.TEXT:
@@ -417,13 +424,27 @@ def _normalize_group_content(content: Dict[str, Any]) -> _Normalized:
     return text or ("(attachment)" if media_urls else "[Photon empty group received]"), mtype, media_urls, media_types
 
 
+def _reply_inner(content: Dict[str, Any]) -> Dict[str, Any]:
+    """The user's own message inside an iMessage threaded reply (``{}`` when absent)."""
+    inner = content.get("content")
+    return inner if isinstance(inner, dict) else {}
+
+
+def _normalize_reply_content(content: Dict[str, Any]) -> _Normalized:
+    """Threaded reply → the inner message. The quoted target travels separately as
+    ``reply_to_text`` (set in ``_dispatch_inbound``), so it is not inlined here."""
+    return _normalize_content(_reply_inner(content))
+
+
 _CONTENT_NORMALIZERS: Dict[Any, Callable[[Dict[str, Any]], _Normalized]] = {
     "text": lambda c: (c.get("text") or "", MessageType.TEXT, [], []),
     "attachment": _normalize_binary_payload, "voice": _normalize_binary_payload,
     "richlink": lambda c: (_format_richlink_content(c), MessageType.TEXT, [], []),
     "group": _normalize_group_content,
+    "reply": _normalize_reply_content,
 }
-_BINARY_CONTENT_TYPES = {"attachment", "voice", "group"}  # may decode/cache media bytes → run off the event loop
+# may decode/cache media bytes → run off the event loop
+_BINARY_CONTENT_TYPES = {"attachment", "voice", "group", "reply"}
 
 
 def _normalize_content(content: Dict[str, Any]) -> _Normalized:
@@ -756,6 +777,20 @@ class PhotonAdapter(BasePlatformAdapter):
         timestamp = _parse_timestamp(event.get("timestamp") or "")
         message_id = event.get("messageId")
         ctype = content.get("type")
+        # iMessage threaded reply: the user's message is the wrapped content. Unwrap it
+        # first so every branch below (U+FFFC wait, media decode, mention gating) sees the
+        # real message; the quoted bubble rides the gateway's reply_to_* fields.
+        reply_kwargs: Dict[str, Any] = {}
+        if ctype == "reply":
+            target_id = content.get("targetMessageId") or None
+            reply_kwargs = {
+                "reply_to_message_id": target_id,
+                "reply_to_text": content.get("targetText") or None,
+                "reply_to_is_own_message": content.get("targetDirection") == "outbound" or bool(
+                    target_id and target_id in self._sent_message_ids),
+            }
+            content = _reply_inner(content)
+            ctype = content.get("type")
 
         def _event(text: str, mtype: MessageType = MessageType.TEXT, **kwargs: Any) -> MessageEvent:
             source = self.build_source(chat_id=space_id, chat_name=space_id, chat_type=chat_type,
@@ -808,7 +843,7 @@ class PhotonAdapter(BasePlatformAdapter):
             if not choice:
                 logger.debug("[photon] ignoring poll vote with empty title")
                 return
-            await self.handle_message(_event(choice))
+            await self.handle_message(_event(choice, **reply_kwargs))
             return
         if ctype in _BINARY_CONTENT_TYPES:
             # Base64 decode + media-cache write of possibly multi-MB payloads — keep it off the event loop.
@@ -821,7 +856,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 return
             text = self._clean_mention_text(text)
         self._record_recent_richlink(space_id, _richlink_url_from_content(content) or text)
-        await self.handle_message(_event(text, mtype, media_urls=media_urls, media_types=media_types))
+        await self.handle_message(_event(text, mtype, media_urls=media_urls, media_types=media_types,
+                                         **reply_kwargs))
 
     # -- Sidecar lifecycle ---------------------------------------------------------
 
