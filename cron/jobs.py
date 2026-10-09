@@ -234,8 +234,12 @@ def _release_flock(lock_fd) -> None:
         lock_fd.close()
 
 
+class _RequiredJobsLockUnavailable(RuntimeError):
+    """Ownership-sensitive operations cannot use the legacy unlocked fallback."""
+
+
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
@@ -244,6 +248,8 @@ def _jobs_lock():
     scheduler."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(_jobs_lock_state, "cross_process", False):
+            raise _RequiredJobsLockUnavailable("Nested jobs lock has no cross-process ownership")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -253,6 +259,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process = False
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
@@ -264,7 +271,13 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process = acquired is True
+                if require_cross_process and acquired is not True:
+                    lock_fd.close()
+                    lock_fd = None
+                    raise _RequiredJobsLockUnavailable("Cron jobs cross-process lock unavailable")
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -275,6 +288,11 @@ def _jobs_lock():
                         lock_fd.close()
                     lock_fd = None
             except (OSError, IOError) as e:
+                if require_cross_process:
+                    if lock_fd is not None:
+                        lock_fd.close()
+                        lock_fd = None
+                    raise _RequiredJobsLockUnavailable("Cron jobs cross-process lock failed") from e
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
@@ -285,6 +303,7 @@ def _jobs_lock():
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process = False
             _jobs_lock_state.load_stamp = None
 
 
@@ -347,7 +366,11 @@ def _under_fire_fence(job_id: str, fn: Callable[[], Any]) -> Any:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
-        return fn()
+        try:
+            with _jobs_lock(require_cross_process=True):
+                return fn()
+        except _RequiredJobsLockUnavailable:
+            return False
 
 
 @contextlib.contextmanager
@@ -357,10 +380,13 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
         if not acquired:
             yield False
             return
-        with _jobs_lock():
-            job = next((item for item in load_jobs() if item.get("id") == job_id), None)
-            claim = job.get("fire_claim") if isinstance(job, dict) else None
-            owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
+        try:
+            with _jobs_lock(require_cross_process=True):
+                job = next((item for item in load_jobs() if item.get("id") == job_id), None)
+                claim = job.get("fire_claim") if isinstance(job, dict) else None
+                owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
+        except _RequiredJobsLockUnavailable:
+            owns_claim = False
         yield owns_claim
 
 
@@ -2538,12 +2564,21 @@ def claim_job_for_fire(
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    """Refresh an active ``fire_claim`` without extending another owner's lease: an execution may
-    outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim."""
+    """Renew only the matching owner under the jobs-store compare-and-swap lock.
+
+    Renewal cannot change ownership, so it must not wait on the side-effect fence:
+    delivery can hold that fence longer than the heartbeat's lock timeout. Claim
+    acquisition/revocation still require the fence; the jobs lock linearizes this
+    timestamp-only refresh against either, rejecting a stale owner's renewal.
+    """
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    try:
+        with _jobs_lock(require_cross_process=True):
+            return _with_job(job_id, apply, False)
+    except _RequiredJobsLockUnavailable:
+        return False
 
 
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by
