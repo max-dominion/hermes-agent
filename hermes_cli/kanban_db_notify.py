@@ -87,7 +87,9 @@ def add_notify_sub(
     omitting it would key the wake into a different session. ``None`` keeps an
     existing row's value. ``delivery_mode``: ``None`` leaves an existing row
     untouched, an explicit valid value is last-write-wins, unknown falls back
-    to ``"notify"``. New subs start caught up (``last_event_id`` =
+    to ``"notify"``. ``delivery_metadata`` merges supplied routing anchors
+    into an existing row so re-subscribing never discards them. New subs start
+    caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
     ``require_exact=True`` rejects a conflicting preserved user/owner identity
     before any write, instead of letting an exact-binding API report false success.
@@ -100,15 +102,18 @@ def add_notify_sub(
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
-        if require_exact:
-            existing = conn.execute("SELECT * FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
-            if existing and (existing["user_id"] != user_id or (
-                existing["notifier_profile"] and existing["notifier_profile"] != notifier_profile
-            )):
-                raise ValueError("existing subscription identity differs; native upsert preserves user/owner")
+        existing = conn.execute("SELECT * FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+        if require_exact and existing and (existing["user_id"] != user_id or (
+            existing["notifier_profile"] and existing["notifier_profile"] != notifier_profile
+        )):
+            raise ValueError("existing subscription identity differs; native upsert preserves user/owner")
+        existing_metadata = _decode_notify_delivery_metadata(existing["delivery_metadata"]) if existing else {}
+        merged_metadata = dict(existing_metadata)
+        if delivery_metadata:
+            merged_metadata.update(delivery_metadata)
+        metadata_json = _encode_notify_delivery_metadata(merged_metadata) if merged_metadata else None
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -123,10 +128,12 @@ def add_notify_sub(
                 insert_mode, metadata_json, int(time.time()), task_id,
             ),
         )
-        # chat_type / delivery_mode / delivery_metadata are last-write-wins;
-        # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+        # chat_type / delivery_mode are last-write-wins; delivery metadata
+        # preserves existing routing fields while supplied fields overwrite them.
+        # user_id, user_id_alt and notifier_profile only self-heal legacy rows lacking one.
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
+            ("user_id", user_id, True),
             ("user_id_alt", user_id_alt, True),
             ("notifier_profile", notifier_profile, True),
             ("delivery_mode", valid_mode, False),
@@ -438,4 +445,4 @@ def rewind_notify_cursor(
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
-from hermes_cli import kanban_db as _kb  # noqa: E402
+from hermes_cli import kanban_db as _kb

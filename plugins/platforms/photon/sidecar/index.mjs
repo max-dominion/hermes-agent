@@ -76,6 +76,7 @@ import {
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
+  createProbeMessageId,
   shouldProbe,
   isZombieSuspect,
 } from "./stream-staleness.mjs";
@@ -362,7 +363,7 @@ console.log = (...args) => {
 // half-open ("zombie") one. `space.get` is purely local in shared/dedicated
 // mode (no chat is created or messaged); only the message read hits the wire.
 const PROBE_SPACE_ID = process.env.PHOTON_PROBE_SPACE_ID || "any;-;+10000000000";
-const PROBE_MSG_PREFIX = "hermes-liveness-probe-";
+
 
 if (!projectId || !projectSecret || !sharedToken) {
   console.error(
@@ -655,28 +656,6 @@ function reactionTargetText(target) {
     : text;
 }
 
-// Quote for an iMessage threaded reply's target. The iMessage provider
-// rebuilds the full target Message (content may itself be a reply — unwrap
-// it); spectrum's generic deserializer gives `{type: "text", text:
-// contentPreview}`; an unresolvable target is a `custom` stub → null.
-// Attachment/voice targets get a short label so the agent knows what was
-// quoted instead of losing the reply context entirely.
-function replyTargetText(target) {
-  let t = target;
-  for (let depth = 0; depth < 3; depth++) {
-    const c = t && typeof t === "object" ? t.content : null;
-    if (!c || typeof c !== "object" || c.type !== "reply") break;
-    t = { content: c.content };
-  }
-  const text = reactionTargetText(t);
-  if (text) return text;
-  const c = t && typeof t === "object" ? t.content : null;
-  if (c && (c.type === "attachment" || c.type === "voice")) {
-    return `(${c.type}${c.name ? `: ${c.name}` : ""})`;
-  }
-  return null;
-}
-
 async function normalizeContent(content) {
   if (!content || typeof content !== "object") {
     return { type: "unknown" };
@@ -733,20 +712,22 @@ async function normalizeContent(content) {
       targetText: reactionTargetText(target),
     };
   }
-  // iMessage threaded reply ("Reply" on a specific bubble): the user's actual
-  // message is the wrapped `content` (text, attachment, voice, group, ...).
-  // Normalize it recursively so media bytes still inline, and pass the target
-  // so Python can fill the gateway's reply_to_message_id / reply_to_text.
+  // iMessage threaded (swipe) reply: spectrum 12.x wraps it as
+  // {type: "reply", content: <inner Content>, target: <Message>}. Normalise the
+  // inner content with the normal ladder and carry a light pointer to the
+  // quoted message, so Python can unwrap it instead of dropping the user's
+  // words as "content type not handled" (#100663).
   if (content.type === "reply") {
     const target = content.target;
     return {
       type: "reply",
-      content: await normalizeContent(content.content),
+      content:
+        content.content && typeof content.content === "object"
+          ? await normalizeContent(content.content)
+          : { type: "unknown" },
       targetMessageId: target?.id ?? null,
-      // Rebuilt iMessage targets carry direction; generic stubs may not.
-      // Python falls back to its own sent-id cache.
       targetDirection: target?.direction ?? null,
-      targetText: replyTargetText(target),
+      targetText: reactionTargetText(target),
     };
   }
   // A user tapping a poll choice arrives as `poll_option` carrying the chosen
@@ -1044,8 +1025,7 @@ async function probeUpstream() {
   if (typeof app?.stop !== "function") {
     return { alive: false, hung: false, reason: "spectrum app not constructed" };
   }
-  const probeId =
-    PROBE_MSG_PREFIX + Date.now() + "-" + Math.random().toString(36).slice(2);
+  const probeId = createProbeMessageId();
   let timer = null;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(
