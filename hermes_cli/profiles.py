@@ -618,6 +618,30 @@ def read_profile_meta(profile_dir: Path) -> dict:
     }
 
 
+def profile_kanban_dispatch_enabled(name: str) -> bool:
+    """False when the profile's ``profile.yaml`` sets ``kanban_dispatch: false``.
+
+    Chat-only profiles (e.g. a Paperclip agent with its own messaging bot) opt out of Kanban
+    work entirely: the dispatcher never spawns them and the decomposer never routes to them.
+    The default profile always accepts work. Missing/unreadable metadata means enabled, so
+    existing profiles keep today's behavior.
+    """
+    try:
+        canon = normalize_profile_name(name)
+    except Exception:
+        return True
+    if canon == "default":
+        return True
+    try:
+        data = _load_yaml_dict(get_profile_dir(canon) / "profile.yaml") or {}
+    except Exception:
+        return True
+    value = data.get("kanban_dispatch", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "no", "off", "0"}
+    return bool(value)
+
+
 def write_profile_meta(
     profile_dir: Path, *, description: Optional[str] = None, description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,

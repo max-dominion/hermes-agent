@@ -161,6 +161,8 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return [], set()
+    # Chat-only profiles (profile.yaml kanban_dispatch: false) never take Kanban work.
+    all_profiles = [p for p in all_profiles if profiles_mod.profile_kanban_dispatch_enabled(p.name)]
     roster = []
     for p in all_profiles:
         desc = (p.description or "").strip()

@@ -1242,14 +1242,20 @@ def check_respawn_guard(
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
-    """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
-    imported (local import avoids a cycle; callers fall back to trusting the
-    assignee)."""
+    """True when the assignee is a live Hermes profile that accepts Kanban work, or ``None``
+    when ``hermes_cli.profiles`` cannot be imported (local import avoids a cycle; callers fall
+    back to trusting the assignee). Profiles with ``kanban_dispatch: false`` in
+    ``profile.yaml`` (chat-only agents) count as non-spawnable, so their cards are never
+    claimed and sit in ``skipped_nonspawnable`` instead of crash-looping."""
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import profile_exists, profile_kanban_dispatch_enabled
     except Exception:
         return None
-    return profile_exists
+
+    def _spawnable(name: str) -> bool:
+        return profile_exists(name) and profile_kanban_dispatch_enabled(name)
+
+    return _spawnable
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
