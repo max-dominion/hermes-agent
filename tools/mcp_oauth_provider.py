@@ -107,6 +107,15 @@ class HermesProviderMixin:
             self._hermes_logger.warning("Invalid refresh response: %s", response.status_code)
             self.context.clear_tokens()
             return False
+        # RFC 6749 §6: a refresh reply may omit refresh_token (no rotation) and scope
+        # (unchanged). Carry both forward as the SDK handler does, or the next expiry
+        # cannot refresh (Dropbox, Google).
+        prior = self.context.current_tokens
+        if prior is not None:
+            if token_response.refresh_token is None:
+                token_response.refresh_token = prior.refresh_token
+            if token_response.scope is None:
+                token_response.scope = prior.scope
         await self._store_tokens(token_response)
         return True
 
