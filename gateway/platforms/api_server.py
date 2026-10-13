@@ -47,6 +47,7 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None)
 _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default="")
+from gateway.platforms.api_server_key_policy import _api_request_key_policy  # noqa: E402
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default="")
 
@@ -1116,6 +1117,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")))
         # alias (client "model") -> {model, provider?, api_key? (UPSTREAM, never logged), base_url?}
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(extra.get("model_routes"))
+        # Scoped bearer keys with code-enforced tool allowlists (voice bridges etc.).
+        from gateway.platforms.api_server_key_policy import parse_key_policies
+        self._key_policies = parse_key_policies(extra.get("key_policies"))
         # Opt-in bare ``model`` passthrough on OpenAI-compatible surfaces (generic clients
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
@@ -1358,7 +1362,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and the
             # token is raw client input — a stray byte must 401, not 500.
             if hmac.compare_digest(token.encode(), expected_key.encode()):
+                _api_request_key_policy.set(None)
                 return None
+            # Scoped key: default listener only, listed paths only, never session headers
+            # unless the policy opts in. Fail closed on everything else.
+            policies = getattr(self, "_key_policies", None) or []
+            if policies and not (profile and profile != "default"):
+                from gateway.platforms.api_server_key_policy import match_policy
+                policy = match_policy(policies, token)
+                if policy is not None:
+                    has_session_hdr = bool(
+                        request.headers.get("X-Hermes-Session-Id", "").strip()
+                        or request.headers.get("X-Hermes-Session-Key", "").strip())
+                    if not policy.allows_path(request.path) or (
+                            has_session_hdr and not policy.session_headers):
+                        logger.warning("API server scoped key %r refused for %s: %s", policy.name,
+                                       request.path[:80], self._request_audit_log_suffix(request))
+                        return web.json_response(
+                            {"error": {"message": "This key is not allowed here",
+                                       "type": "gateway_auth_error", "code": "key_scope_denied"}},
+                            status=403)
+                    _api_request_key_policy.set(policy)
+                    return None
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
 
@@ -3631,10 +3656,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
+        request_key_policy = _api_request_key_policy.get()
 
         def _run():
             from gateway.session_context import clear_session_vars
-            with self._profile_scope(request_profile):
+            from gateway.platforms.api_server_key_policy import (
+                apply_policy_to_agent, policy_tool_whitelist)
+            with self._profile_scope(request_profile), policy_tool_whitelist(request_key_policy):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
@@ -3649,6 +3677,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                    if request_key_policy is not None:
+                        apply_policy_to_agent(agent, request_key_policy)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:

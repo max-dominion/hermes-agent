@@ -654,6 +654,11 @@ def _dispatch_authorized_once(
             callback()
 
     block_message, block_error_type = scope_block, "tool_scope_block"
+    _policy_tools = getattr(agent, "_hermes_key_policy_tools", None)
+    if block_message is None and _policy_tools is not None and ref.name not in _policy_tools:
+        # Scoped API key (gateway/platforms/api_server_key_policy.py): hard allowlist,
+        # checked per call on whatever worker thread runs it.
+        block_message = f"Tool '{ref.name}' is not allowed on this key."
     if block_message is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731

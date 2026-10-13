@@ -54,6 +54,12 @@ def _publish_tool_snapshot(
     was published and a stale (older-generation) rebuild can't overwrite a newer one. Returns
     the added names, or None when nothing was published (unchanged, or a newer snapshot won)."""
     with _agent_tools_lock:
+        # Scoped API key (api_server_key_policy): a rebuild may never widen the allowlist.
+        _policy_tools = getattr(agent, "_hermes_key_policy_tools", None)
+        if _policy_tools is not None:
+            new_defs = [t for t in new_defs if _def_name(t) in _policy_tools]
+            new_names = {n for n in new_names if n in _policy_tools}
+            staged_engine_names = {n for n in staged_engine_names if n in _policy_tools}
         # Tolerate an agent that never set the generation (or a non-int mock).
         published_gen = getattr(agent, "_tool_snapshot_generation", -1)
         published_gen = published_gen if isinstance(published_gen, int) else -1
