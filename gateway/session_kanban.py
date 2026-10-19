@@ -347,6 +347,17 @@ def _run_task_turns(agent, frame, history, context):
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
+    if not context['goal_mode']:
+        return _run_task_turns_owned(agent, prompt, history, context)
+    # Dominion: the managed Goal worker is the native loop owner for the whole run
+    # (bind_worker_context already proved the exact claim). The stop gate accepts progress
+    # checkpoints from it, and the first turn is told so.
+    from hermes_cli.kanban_goal_worker import goal_loop_owner, with_checkpoint_note
+    with goal_loop_owner(agent):
+        return _run_task_turns_owned(agent, with_checkpoint_note(prompt), history, context)
+
+
+def _run_task_turns_owned(agent, prompt, history, context):
     result = agent.run_conversation(prompt, conversation_history=history)
 
     def recover(nudge):
@@ -367,17 +378,24 @@ def _run_task_turns(agent, frame, history, context):
     from hermes_cli.goals import run_kanban_goal_loop, DEFAULT_MAX_TURNS
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_goal_worker import goal_status, guarded_turn
     def status():
         with connect_closing() as conn:
-            return kb.goal_run_status(conn, context['task_id'], context['run_id'])
+            raw = kb.goal_run_status(conn, context['task_id'], context['run_id'])
+        return goal_status(raw, result, agent)
     def block(reason):
         with connect_closing() as conn:
             kb.block_task(conn, context['task_id'], reason=reason, expected_run_id=context['run_id'])
     def turn(prompt):
         nonlocal result
-        result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id))
-        return result.get('final_response', '')
-    run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
+        try:
+            result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id))
+        except Exception as exc:
+            result = {'failed': True, 'error': f'Goal turn failed: {type(exc).__name__}'}
+            raise
+        return {'response': result.get('final_response', '') or '', 'failed': bool(result.get('failed')),
+                'failure_reason': result.get('failure_reason')}
+    run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=guarded_turn(status, turn),
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
         first_response=result.get('final_response', ''))
     return result

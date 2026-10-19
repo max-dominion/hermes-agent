@@ -31,7 +31,7 @@ def _authorize_query(builder: str, name: str, oauth_cfg: dict, monkeypatch) -> d
     """Run the real SDK authorization-code grant until the URL would open; return its query."""
     seen: list[str] = []
 
-    def _announce(url, port, redirect_uri):
+    def _announce(url, port, redirect_uri, *args, **kwargs):
         seen.append(url)
         raise _Opened
 

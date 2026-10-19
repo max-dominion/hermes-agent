@@ -50,12 +50,15 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None) -> None:
+def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None,
+                            last_result: list | None = None) -> None:
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
     ``run_turn`` defaults to the bare ``-Q`` turn (final answer only). The ``-q`` worker path
     passes ``cli.chat`` so every follow-up turn keeps the tool activity feed that the Kanban
     worker log is made of. The caller swallows all errors: a broken loop must never wedge a worker.
+    ``last_result`` (Dominion) is a one-item list holding the latest turn's result; the loop
+    updates it so the caller's exit code reflects the turn that actually ran last.
     """
     from cli import _int_or, _sync_cli_session_id_from_agent
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
@@ -80,8 +83,20 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
     if not goal_text:
         return
 
+    from hermes_cli.kanban_goal_worker import goal_status, guarded_turn
+
     def _quiet_turn(prompt: str) -> dict:
-        result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        try:
+            result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        except Exception as exc:
+            if last_result is not None:
+                last_result[0] = {"failed": True, "error": f"Goal turn failed: {type(exc).__name__}"}
+            raise
+        if last_result is not None:
+            last_result[0] = result
+        # Dominion: the next continuation must see THIS turn's transcript, not the seed history.
+        if isinstance(result, dict) and isinstance(result.get("messages"), list):
+            cli.conversation_history = result["messages"]
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
@@ -96,14 +111,18 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
 
     def _task_status() -> str | None:
         with _kbc.connect_closing() as c:
-            return _kb.goal_run_status(c, task_id, worker_run_id)
+            raw = _kb.goal_run_status(c, task_id, worker_run_id)
+        # Dominion: board transitions win; a released run (budget finalizer/reclaim) is
+        # superseded; a failed or interrupted latest turn stops instead of re-entering the model.
+        latest = last_result[0] if last_result is not None else getattr(cli, "_last_turn_result", None)
+        return goal_status(raw, latest, getattr(cli, "agent", None))
 
     def _block(reason: str) -> None:
         with _kbc.connect_closing() as c:
             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
 
     _run_loop(
-        task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
+        task_id=task_id, goal_text=goal_text, run_turn=guarded_turn(_task_status, run_turn or _quiet_turn),
         task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=log or (lambda m: logger.info("%s", m)),
@@ -194,6 +213,26 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         bind_quiet_session_key, continue_quiet_notify_completions, exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
     )
 
+    # Dominion: a native Goal worker proves it owns an active Goal run BEFORE any model call
+    # (fail closed), owns the stop gate for the whole run, and tells the first turn that
+    # evidence-backed checkpoints are allowed.
+    from hermes_cli.kanban_goal_worker import goal_loop_owner, goal_mode_requested, require_goal_owner, with_checkpoint_note
+    goal_owner = goal_mode_requested() and bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+    if goal_owner:
+        require_goal_owner()
+        effective_query = with_checkpoint_note(effective_query)
+    with goal_loop_owner(cli.agent if goal_owner else None):
+        _run_quiet_single_query_owned(cli, effective_query, emitter)
+
+
+def _run_quiet_single_query_owned(cli, effective_query, emitter=None):
+    from cli import _emit_interrupted_session_end, _run_kanban_goal_loop_q, _single_query_exit_code, _sync_cli_session_id_from_agent
+    from agent.interrupt_compat import _accepts_keyword
+    from agent.turn_author import take_turn_author_from_env
+    from hermes_cli.quiet_single_query import (
+        bind_quiet_session_key, continue_quiet_notify_completions, exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
+    )
+
     author = take_turn_author_from_env()
     # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
@@ -213,6 +252,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
+        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and isinstance(result, dict) \
+                and isinstance(result.get("messages"), list):
+            # Dominion: Goal continuations resume from this turn's transcript.
+            cli.conversation_history = result["messages"]
         # Kanban worker: a turn that died on a retryable provider failure is retried
         # IN PLACE (same session, context preserved) instead of ending the run silently.
         # Authority (typed retryable failure, no interrupt / terminal settlement) and the
@@ -313,10 +356,16 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # reports "running" and a continue verdict would re-enter the model under an
     # authority this process can no longer prove (round-3 finding).
     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == 0:
+        latest = [result]
         try:
-            _run_kanban_goal_loop_q(cli, response)
+            _run_kanban_goal_loop_q(cli, response, last_result=latest)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
+        if latest[0] is not result:
+            # Dominion: the exit code reports the turn that ran last (a billing wall on a
+            # continuation is EX_TEMPFAIL, a raised turn is a failure), not the first turn.
+            result = latest[0]
+            _exit_code = _single_query_exit_code(result)
 
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)

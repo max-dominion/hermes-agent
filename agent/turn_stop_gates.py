@@ -85,7 +85,8 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     try:
         from agent.kanban_stop import build_kanban_stop_nudge
 
-        goal_loop_active = bool(getattr(agent, "_kanban_goal_loop_active", False))
+        from hermes_cli.kanban_goal_worker import owner_active
+        goal_loop_active = owner_active(agent)
         return build_kanban_stop_nudge(
             messages=messages,
             attempts=getattr(agent, "_kanban_stop_nudges", 0),

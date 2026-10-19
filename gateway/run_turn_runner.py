@@ -111,7 +111,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.run_turn_progress import GatewayTurnProgressMixin, system_notices_on
 from gateway.session_execution import GatewaySessionAgentMixin
 
 
@@ -324,7 +324,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         sync worker thread; hop onto the gateway loop. Fired-once latch lives on the cached agent."""
         from gateway.run import render_notice_line
         from gateway.warning_notifications import is_diagnostic_notice, render_notification
-        if self._ctx.mute_notification_reply or not self._status_live() or not self._system_notices_on:
+        if self._ctx.mute_notification_reply or not self._status_live() or not system_notices_on(self):
             return
         diagnostic = is_diagnostic_notice(notice)
         def present():
@@ -471,7 +471,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run import _platform_config_key
         agent.memory_notifications = resolve_display_setting(
             ctx.user_config or {}, _platform_config_key(ctx.source.platform), "memory_notifications", "on",
-        ) if self._system_notices_on else "off"
+        ) if system_notices_on(self) else "off"
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).

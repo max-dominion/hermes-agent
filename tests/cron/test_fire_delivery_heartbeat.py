@@ -91,6 +91,9 @@ def test_fenced_delivery_settles_with_live_heartbeat(tmp_path, monkeypatch, outc
     job = jobs.create_job(prompt="synthetic", schedule="every 5m", deliver="bot-chat")
     job = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(job, dict)
+    # Upstream now hands agent-job results to the durable delivery queue; the direct fenced send
+    # (the path whose heartbeat this guards) remains for script-only jobs.
+    job["no_agent"] = True
     delivering = threading.Event()
     renewed = threading.Event()
     cancel = threading.Event()

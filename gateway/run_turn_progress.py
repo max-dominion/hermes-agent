@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import functools
 import logging
 import queue
 import re
@@ -102,15 +101,29 @@ def publish_worker_tool_event(authority, session_id, generation, frame) -> bool:
     return True
 
 
-class GatewayTurnProgressMixin:
-    @functools.cached_property
-    def _system_notices_on(self) -> bool:
-        """``display[.platforms.<p>].system_notices`` for this turn's platform (read once per turn; Dominion)."""
+def system_notices_on(runner_self) -> bool:
+    """``display[.platforms.<p>].system_notices`` for this turn's platform (Dominion). Read once per
+    turn and cached on the TurnRunner; a stand-in without a turn context fails open (notices on)."""
+    cached = getattr(runner_self, "__dict__", {}).get("_system_notices_cache")
+    if cached is not None:
+        return cached
+    ctx = getattr(runner_self, "_ctx", None)
+    source = getattr(ctx, "source", None)
+    if ctx is None or source is None:
+        return True
+    try:
         from gateway.display_config import resolve_display_setting
         from gateway.run import _platform_config_key
-        ctx = self._ctx
-        return bool(resolve_display_setting(
-            ctx.user_config or {}, _platform_config_key(ctx.source.platform), "system_notices", True))
+        value = bool(resolve_display_setting(
+            getattr(ctx, "user_config", None) or {}, _platform_config_key(source.platform), "system_notices", True))
+    except Exception:
+        value = True
+    with suppress(Exception):
+        runner_self._system_notices_cache = value
+    return value
+
+
+class GatewayTurnProgressMixin:
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -221,7 +234,7 @@ class GatewayTurnProgressMixin:
         ctx = self._ctx
         from gateway.warning_notifications import render_notification
         status = kwargs.get("status")
-        if not self._system_notices_on:
+        if not system_notices_on(self):
             return
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
@@ -994,7 +1007,7 @@ class GatewayTurnProgressMixin:
         if ctx.mute_notification_reply or not self._status_live():
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
-        if prepared is not None and not self._system_notices_on:
+        if prepared is not None and not system_notices_on(self):
             prepared = None
         if prepared is None:
             logger.debug(
