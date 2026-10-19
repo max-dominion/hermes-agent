@@ -76,6 +76,7 @@ import {
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
+  createProbeMessageId,
   shouldProbe,
   isZombieSuspect,
 } from "./stream-staleness.mjs";
@@ -362,7 +363,7 @@ console.log = (...args) => {
 // half-open ("zombie") one. `space.get` is purely local in shared/dedicated
 // mode (no chat is created or messaged); only the message read hits the wire.
 const PROBE_SPACE_ID = process.env.PHOTON_PROBE_SPACE_ID || "any;-;+10000000000";
-const PROBE_MSG_PREFIX = "hermes-liveness-probe-";
+
 
 if (!projectId || !projectSecret || !sharedToken) {
   console.error(
@@ -733,19 +734,22 @@ async function normalizeContent(content) {
       targetText: reactionTargetText(target),
     };
   }
-  // iMessage threaded reply ("Reply" on a specific bubble): the user's actual
-  // message is the wrapped `content` (text, attachment, voice, group, ...).
-  // Normalize it recursively so media bytes still inline, and pass the target
-  // so Python can fill the gateway's reply_to_message_id / reply_to_text.
+  // iMessage threaded (swipe) reply: spectrum 12.x wraps it as
+  // {type: "reply", content: <inner Content>, target: <Message>}. Normalise the
+  // inner content with the normal ladder and carry a light pointer to the
+  // quoted message, so Python can unwrap it instead of dropping the user's
+  // words as "content type not handled" (#100663).
   if (content.type === "reply") {
     const target = content.target;
     return {
       type: "reply",
-      content: await normalizeContent(content.content),
+      content:
+        content.content && typeof content.content === "object"
+          ? await normalizeContent(content.content)
+          : { type: "unknown" },
       targetMessageId: target?.id ?? null,
-      // Rebuilt iMessage targets carry direction; generic stubs may not.
-      // Python falls back to its own sent-id cache.
       targetDirection: target?.direction ?? null,
+      // Dominion: unwraps a quoted reply and labels attachment/voice targets.
       targetText: replyTargetText(target),
     };
   }
@@ -1044,8 +1048,7 @@ async function probeUpstream() {
   if (typeof app?.stop !== "function") {
     return { alive: false, hung: false, reason: "spectrum app not constructed" };
   }
-  const probeId =
-    PROBE_MSG_PREFIX + Date.now() + "-" + Math.random().toString(36).slice(2);
+  const probeId = createProbeMessageId();
   let timer = null;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(
