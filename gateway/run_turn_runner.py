@@ -468,9 +468,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # display[.platforms.<plat>].memory_notifications: off | on (generic "💾 Memory updated") | verbose.
         # Dominion: per-platform resolution, and system_notices=false forces it off.
         from gateway.display_config import resolve_display_setting
-        from gateway.run import _platform_config_key
+        from gateway.run_turn_progress import platform_display_key
         agent.memory_notifications = resolve_display_setting(
-            ctx.user_config or {}, _platform_config_key(ctx.source.platform), "memory_notifications", "on",
+            ctx.user_config or {}, platform_display_key(ctx.source.platform), "memory_notifications", "on",
         ) if system_notices_on(self) else "off"
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in

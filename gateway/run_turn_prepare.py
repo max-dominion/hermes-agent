@@ -462,7 +462,8 @@ class GatewayTurnPrepareMixin:
         turn_sidecar_notes.append(context_note)
 
         try:
-            should_notify = reset_reason == "suspended" and self._system_notices_enabled(source.platform)
+            should_notify = reset_reason == "suspended" and (
+                getattr(self, "_system_notices_enabled", None) is None or self._system_notices_enabled(source.platform))
             adapter = self._delivery_adapter_for(source) if should_notify else None
             if adapter:
                 notice = t("gateway.session.auto_reset_notice")

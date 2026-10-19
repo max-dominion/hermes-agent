@@ -51,6 +51,13 @@ def _acp_launch(runner, source) -> bool:
         return False
 
 
+def _display_flag(runner, method: str, platform) -> bool:
+    """Dominion per-platform display flag from the runner's config-loader mixin; a runner
+    composed without it (tests, partial mixes) keeps upstream behavior (flag on)."""
+    fn = getattr(runner, method, None)
+    return True if fn is None else bool(fn(platform))
+
+
 class GatewayTurnPersistenceMixin:
     async def _hmwa_shape_agent_response(
         self, agent_result, source, history, session_entry, session_key,
@@ -121,7 +128,7 @@ class GatewayTurnPersistenceMixin:
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
-            if response and not self._error_detail_enabled(source.platform) and self._is_gateway_authored_reply(
+            if response and not _display_flag(self, "_error_detail_enabled", source.platform) and self._is_gateway_authored_reply(
                 agent_result, response,
             ):
                 from gateway.display_config import NEUTRAL_ERROR_REPLY
@@ -620,7 +627,7 @@ class GatewayTurnPersistenceMixin:
                 await self._hmwa_close_failed_turn(session_entry.session_id, PARTIAL_FAILED_TURN_NOTICE)
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
-        if not self._error_detail_enabled(source.platform):
+        if not _display_flag(self, "_error_detail_enabled", source.platform):
             from gateway.display_config import NEUTRAL_ERROR_REPLY
             from gateway.session_results import record_unexecuted_failure
             return record_unexecuted_failure(NEUTRAL_ERROR_REPLY)

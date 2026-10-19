@@ -50,16 +50,21 @@ def _record_kanban_budget_exhausted(
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
 
     Routed via ``_record_task_failure`` so exhaustion counts toward the failure
-    circuit. The expected run is checked atomically before task/counter writes;
-    repeated finalization or a stale worker cannot mutate a successor's claim.
+    circuit. Dominion: when the dispatcher pinned ``HERMES_KANBAN_RUN_ID`` (every real
+    worker), the expected run is checked atomically before task/counter writes, so repeated
+    finalization or a stale worker cannot mutate a successor's claim. A malformed run id
+    fails closed; an absent one keeps upstream's unbound record.
     """
-    try:
-        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
-    except ValueError:
-        logger.warning("Cannot record Kanban budget exhaustion without a valid run id")
-        return
-    if run_id < 1:
-        return
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    run_id = None
+    if raw_run_id:
+        try:
+            run_id = int(raw_run_id)
+        except ValueError:
+            logger.warning("Cannot record Kanban budget exhaustion without a valid run id")
+            return
+        if run_id < 1:
+            return
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
@@ -74,7 +79,7 @@ def _record_kanban_budget_exhausted(
                     "task could not complete within the allowed iterations"
                 ),
                 outcome="timed_out",
-                expected_run_id=run_id,
+                **({"expected_run_id": run_id} if run_id is not None else {}),
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},

@@ -101,6 +101,14 @@ def publish_worker_tool_event(authority, session_id, generation, frame) -> bool:
     return True
 
 
+def platform_display_key(platform) -> str:
+    """``display.platforms`` key for a Platform enum or a plain platform string (Dominion)."""
+    from gateway.config import Platform
+    if platform == Platform.LOCAL or platform == "local":
+        return "cli"
+    return str(getattr(platform, "value", platform) or "cli")
+
+
 def system_notices_on(runner_self) -> bool:
     """``display[.platforms.<p>].system_notices`` for this turn's platform (Dominion). Read once per
     turn and cached on the TurnRunner; a stand-in without a turn context fails open (notices on)."""
@@ -113,9 +121,8 @@ def system_notices_on(runner_self) -> bool:
         return True
     try:
         from gateway.display_config import resolve_display_setting
-        from gateway.run import _platform_config_key
         value = bool(resolve_display_setting(
-            getattr(ctx, "user_config", None) or {}, _platform_config_key(source.platform), "system_notices", True))
+            getattr(ctx, "user_config", None) or {}, platform_display_key(source.platform), "system_notices", True))
     except Exception:
         value = True
     with suppress(Exception):
