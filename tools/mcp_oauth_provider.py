@@ -29,9 +29,14 @@ class HermesProviderMixin:
 
     _hermes_logger: logging.Logger = logger
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
+    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser",
+                 extra_authorize_params: dict[str, str] | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._hermes_oauth_flow = oauth_flow
+        # oauth.extra_authorize_params — provider-specific authorization-URL params the SDK never
+        # sends, e.g. Dropbox issues a refresh token only with token_access_type=offline.
+        if extra_authorize_params and self.context.redirect_handler:
+            self.context.redirect_handler = _with_authorize_params(self.context.redirect_handler, extra_authorize_params)
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
@@ -107,8 +112,46 @@ class HermesProviderMixin:
             self._hermes_logger.warning("Invalid refresh response: %s", response.status_code)
             self.context.clear_tokens()
             return False
+        # RFC 6749 §6: a refresh reply may omit refresh_token (no rotation) and scope
+        # (unchanged). Carry both forward as the SDK handler does, or the next expiry
+        # cannot refresh (Dropbox, Google).
+        prior = self.context.current_tokens
+        if prior is not None:
+            if token_response.refresh_token is None:
+                token_response.refresh_token = prior.refresh_token
+            if token_response.scope is None:
+                token_response.scope = prior.scope
         await self._store_tokens(token_response)
         return True
+
+
+def extra_authorize_params(cfg: dict) -> dict[str, str]:
+    """``oauth.extra_authorize_params`` as a str→str dict; anything but a mapping is ignored."""
+    raw = cfg.get("extra_authorize_params")
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("MCP OAuth: oauth.extra_authorize_params must be a mapping; ignoring %s", type(raw).__name__)
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if v is not None}
+
+
+def _with_authorize_params(redirect_handler, extra: dict[str, str]):
+    """Wrap *redirect_handler* so the authorization URL carries *extra*. Params the SDK already
+    set (state, PKCE, client_id, redirect_uri, scope, ...) win: overriding them would break the flow."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    async def _handler(authorization_url: str) -> None:
+        parts = urlsplit(authorization_url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        present = {k for k, _ in query}
+        skipped = sorted(k for k in extra if k in present)
+        if skipped:
+            logger.warning("MCP OAuth: oauth.extra_authorize_params cannot override %s; ignoring", ", ".join(skipped))
+        query += [(k, v) for k, v in extra.items() if k not in present]
+        await redirect_handler(urlunsplit(parts._replace(query=urlencode(query))))
+
+    return _handler
 
 
 def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict | None) -> tuple[dict, "HermesTokenStorage"]:
@@ -140,4 +183,5 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
         "callback_handler": mo._make_callback_waiter(port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))),
         "token_user_agent": mo.token_request_user_agent(cfg),
         "oauth_flow": cfg.get("flow", "browser"),
+        "extra_authorize_params": extra_authorize_params(cfg),
         **mo.cimd_provider_kwargs(cfg)}

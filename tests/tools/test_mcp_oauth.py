@@ -371,6 +371,47 @@ class TestBuildOAuthAuth:
         assert result is False
         assert provider.context.current_tokens is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply, expected_refresh, expected_scope",
+        [
+            # RFC 6749 §6: no rotation, scope unchanged -> both carried forward.
+            ({"access_token": "new-access", "token_type": "Bearer", "expires_in": 14400},
+             "old-refresh", "files.read"),
+            # Rotation -> the server's new values win.
+            ({"access_token": "new-access", "token_type": "Bearer", "expires_in": 14400,
+              "refresh_token": "rotated-refresh", "scope": "files.write"},
+             "rotated-refresh", "files.write"),
+        ],
+        ids=["omitted-keeps-prior", "rotated-wins"],
+    )
+    async def test_refresh_reply_persists_usable_refresh_token(
+        self, tmp_path, monkeypatch, reply, expected_refresh, expected_scope
+    ):
+        import json
+        import httpx
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+        provider.context.current_tokens = OAuthToken(
+            access_token="old-access", token_type="Bearer",
+            refresh_token="old-refresh", scope="files.read",
+        )
+
+        response = httpx.Response(200, content=json.dumps(reply).encode())
+        assert await provider._handle_refresh_response(response) is True
+
+        current = provider.context.current_tokens
+        assert current.access_token == "new-access"
+        assert current.refresh_token == expected_refresh
+        assert current.scope == expected_scope
+        stored = await provider.context.storage.get_tokens()
+        assert stored.refresh_token == expected_refresh
+        assert stored.scope == expected_scope
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
