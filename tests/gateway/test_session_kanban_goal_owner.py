@@ -19,8 +19,10 @@ class _Agent:
     def get_messages_as_conversation(self, _sid):
         return [{"role": "user", "content": "from-store"}]
 
-    def run_conversation(self, message, conversation_history=None):
+    def run_conversation(self, message, conversation_history=None, turn_author=None):
         self.calls.append(message)
+        # Every Goal turn, including continuations, is authored by the dispatcher (#137406).
+        assert turn_author == session_kanban.KANBAN_TURN_AUTHOR
         # The live loop owner must suppress the terminal-only stop nudge.
         assert self._kanban_goal_loop_active is True
         assert _kanban_stop_nudge(self, []) is None
