@@ -1639,6 +1639,27 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
+        # Opt-in fleet policy: shared chat needs an inline, SDK-confirmed user
+        # mention. Reply-pings, quoted raw tokens without metadata, free-response
+        # channels, joined threads and voice-linked channels cannot bypass it.
+        if self.config.extra.get("strict_explicit_mentions") is True:
+            is_dm = isinstance(message.channel, discord.DMChannel)
+            if not is_dm:
+                own_id = str(self._client.user.id)
+                sdk_ids = {str(user.id) for user in getattr(message, "mentions", [])}
+                reason = None
+                if own_id not in sdk_ids or own_id not in self._raw_mentioned_user_ids(message):
+                    reason = "explicit_user_mention_required"
+                elif getattr(message.author, "bot", False):
+                    trusted = self._gate_csv_set(self.config.extra.get("trusted_bot_ids"))
+                    if str(message.author.id) not in trusted:
+                        reason = "untrusted_bot"
+                if reason:
+                    logger.info(
+                        "[Discord] admission denied message=%s channel=%s author=%s reason=%s no_model_work=true",
+                        message_id, getattr(message.channel, "id", ""), message.author.id, reason,
+                    )
+                    return False, False
         role_authorized = False
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
@@ -4942,6 +4963,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """Snapshot gate env vars; must run inside the owning profile's runtime scope
         (connect() does under multiplex) to capture that profile's values."""
         self._gate_env_snapshot = {key: _scoped_gate_env(key) for key in _GATE_ENV_KEYS}
+        if self.config.extra.get("strict_explicit_mentions") is True:
+            logger.info(
+                "[Discord] strict mention policy loaded require_mention=%s thread_require_mention=%s free_response=%s trusted_bot_count=%d",
+                self._discord_require_mention(), self._discord_thread_require_mention(),
+                sorted(self._discord_free_response_channels()),
+                len(self._gate_csv_set(self.config.extra.get("trusted_bot_ids"))),
+            )
 
     def _gate_env(self, name: str, default: str = "") -> str:
         """Read a gate env var from this adapter's snapshot (scope fallback)."""
