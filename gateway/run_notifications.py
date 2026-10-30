@@ -596,6 +596,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     platform.value,
                 )
                 continue
+            # Startup-only opt-in: quiet maintenance must not disable the
+            # separate restart/active-session interruption warning policy.
+            extra = getattr(platform_cfg, "extra", None)
+            if isinstance(extra, dict) and extra.get("gateway_startup_notification") is False:
+                logger.info(
+                    "Home-channel startup notification suppressed: %s has gateway_startup_notification=false",
+                    platform.value,
+                )
+                continue
             target = _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id)
             if target in skipped or target in delivered:
                 continue
