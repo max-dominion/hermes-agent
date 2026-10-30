@@ -125,8 +125,8 @@ def test_policy_is_opt_in():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('own_id', BOT_IDS)
-@pytest.mark.parametrize('suffix,expected', [('/status', True), ('', False)])
-async def test_strict_tag_retention_preserves_command_and_bare_ping(monkeypatch, own_id, suffix, expected):
+@pytest.mark.parametrize('suffix,expected,with_media', [('/status', True, False), ('', False, False), ('/status', True, True)])
+async def test_strict_tag_retention_preserves_command_and_bare_ping(monkeypatch, own_id, suffix, expected, with_media):
     for key in list(mod.os.environ):
         if key.startswith('DISCORD_'):
             monkeypatch.delenv(key, raising=False)
@@ -142,6 +142,8 @@ async def test_strict_tag_retention_preserves_command_and_bare_ping(monkeypatch,
     a._ready_event.set()
     a._text_batch_delay_seconds = 0
     a.handle_message = AsyncMock()
+    if with_media:
+        a._collect_attachment_media = AsyncMock(return_value=(['https://example.test/image.png'], ['image'], ''))
     msg = NS(id=124, content=f'<@{own_id}> {suffix}', mentions=[own], attachments=[],
              reference=None, created_at=datetime.now(timezone.utc), channel=Channel(),
              guild=Channel.guild, author=NS(id=42, bot=False, name='fixture', display_name='fixture', roles=[]),
