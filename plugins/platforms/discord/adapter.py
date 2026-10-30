@@ -5838,6 +5838,16 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 )
                 return False
             event_text = "(The user sent a message with no text content)"
+        # Strict fleet admission already verified the genuine SDK mention and
+        # caller. Keep the user's original tag in conversational model input:
+        # older persisted prompts can otherwise reject a valid, normalized turn.
+        # Commands still use normalized_content, and bare-ping/DM behavior above
+        # stays unchanged. Never manufacture a mention from reply metadata.
+        if (self.config.extra.get("strict_explicit_mentions") is True
+                and mention_prefix and not _is_dm and msg_type != MessageType.COMMAND):
+            event_text = raw_content
+            if pending_text_injection:
+                event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))

@@ -98,6 +98,10 @@ async def test_strict_native_dispatch(monkeypatch, own_id, case, expected, caplo
     with caplog.at_level('INFO'):
         await a._dispatch_discord_message(msg)
     assert bool(a.handle_message.await_count) is expected
+    if expected and case != 'dm':
+        call = a.handle_message.await_args
+        assert call is not None
+        assert call.args[0].text == content
     if not expected and case != 'stranger':
         assert 'no_model_work=true' in caplog.text
 
@@ -117,3 +121,35 @@ async def test_recovery_uses_strict_admission(monkeypatch):
 def test_policy_is_opt_in():
     a=mod.DiscordAdapter(PlatformConfig(enabled=True,token='fixture'))
     assert a.config.extra.get('strict_explicit_mentions') is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('own_id', BOT_IDS)
+@pytest.mark.parametrize('suffix,expected', [('/status', True), ('', False)])
+async def test_strict_tag_retention_preserves_command_and_bare_ping(monkeypatch, own_id, suffix, expected):
+    for key in list(mod.os.environ):
+        if key.startswith('DISCORD_'):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(mod.discord, 'Thread', Channel)
+    monkeypatch.setattr(mod.discord, 'DMChannel', DM)
+    a = mod.DiscordAdapter(PlatformConfig(enabled=True, token='fixture', extra={
+        'strict_explicit_mentions': True, 'require_mention': True,
+        'thread_require_mention': True, 'history_backfill': False}))
+    own = NS(id=own_id, bot=True)
+    a._client = NS(user=own, get_guild=lambda _: None)
+    a._allowed_user_ids = {'42'}
+    a._allowed_role_ids = set()
+    a._ready_event.set()
+    a._text_batch_delay_seconds = 0
+    a.handle_message = AsyncMock()
+    msg = NS(id=124, content=f'<@{own_id}> {suffix}', mentions=[own], attachments=[],
+             reference=None, created_at=datetime.now(timezone.utc), channel=Channel(),
+             guild=Channel.guild, author=NS(id=42, bot=False, name='fixture', display_name='fixture', roles=[]),
+             type=mod.discord.MessageType.default, message_snapshots=[])
+    await a._dispatch_discord_message(msg)
+    assert bool(a.handle_message.await_count) is expected
+    if expected:
+        call = a.handle_message.await_args
+        assert call is not None
+        assert call.args[0].text == '/status'
+        assert call.args[0].message_type == mod.MessageType.COMMAND
