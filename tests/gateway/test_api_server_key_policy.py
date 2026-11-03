@@ -85,7 +85,7 @@ def test_tool_refresh_never_widens_policy():
     added = mta._publish_tool_snapshot(
         agent, [_td("read_file"), _td("terminal"), _td("mcp__x__send")],
         {"read_file", "terminal", "mcp__x__send"}, snapshot_generation=1,
-        staged_engine_names=set(), content_aware=False, prefix_registered=None)
+        built_generation=1, selection=(), staged_engine_names=set(), content_aware=False, prefix_registered=None)
     assert not added
     assert agent.valid_tool_names == {"read_file"}
 
