@@ -1355,8 +1355,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return ("discord_intents_required", guidance, False)
         return ("discord_connect_error", f"Discord startup failed: {error}", True)
 
-    def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple[bool, bool]:
+    def _sender_channel_mention_exception(self, message: Any) -> bool:
+        """Exact text-channel/user opt-in; never inherit to threads or bots."""
+        rules = self.config.extra.get("mention_free_channel_users", {})
+        if not isinstance(rules, dict) or not rules:
+            return False
+        if (getattr(message.author, "bot", False)
+                or not isinstance(message.channel, discord.TextChannel)):
+            return False
+        users = rules.get(str(message.channel.id))
+        return isinstance(users, list) and str(message.author.id) in users
+
+    def _discord_message_admission(
+        self, message: Any, *, claim: bool, live: bool = False,
+    ) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
+        sender_exception = live and self._sender_channel_mention_exception(message)
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
@@ -1367,16 +1381,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
-        # Opt-in fleet policy: shared chat needs an inline, SDK-confirmed user
-        # mention. Reply-pings, quoted raw tokens without metadata, free-response
-        # channels, joined threads and voice-linked channels cannot bypass it.
+        # Shared chat needs an inline, SDK-confirmed mention unless a live event
+        # matches the explicit sender/text-channel opt-in. Recovery, reply-pings,
+        # free-response channels and joined threads gain no blanket exception.
         if self.config.extra.get("strict_explicit_mentions") is True:
             is_dm = isinstance(message.channel, discord.DMChannel)
             if not is_dm:
                 own_id = str(self._client.user.id)
                 sdk_ids = {str(user.id) for user in getattr(message, "mentions", [])}
                 reason = None
-                if own_id not in sdk_ids or own_id not in self._raw_mentioned_user_ids(message):
+                if (not sender_exception and
+                        (own_id not in sdk_ids or own_id not in self._raw_mentioned_user_ids(message))):
                     reason = "explicit_user_mention_required"
                 elif getattr(message.author, "bot", False):
                     trusted = self._gate_csv_set(self.config.extra.get("trusted_bot_ids"))
@@ -1446,10 +1461,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
-        admitted, role_authorized = self._discord_message_admission(message, claim=True)
+        admitted, role_authorized = self._discord_message_admission(message, claim=True, live=True)
         if not admitted:
             return False
-        return await self._handle_message(message, role_authorized=role_authorized)
+        return await self._handle_message(
+            message, role_authorized=role_authorized,
+            live_mention_exception=self._sender_channel_mention_exception(message),
+        )
 
     # --- gateway_platform_event fire-sites ---
 
@@ -5657,6 +5675,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _handle_message(
         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+        live_mention_exception: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
@@ -5719,6 +5738,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
+                or (live_mention_exception and not recovered
+                    and self._sender_channel_mention_exception(message))
             )
             in_bot_thread = self._in_bot_thread(message)
             if require_mention and not is_free_channel and not in_bot_thread:
