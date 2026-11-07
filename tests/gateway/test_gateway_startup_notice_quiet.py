@@ -16,7 +16,7 @@ SHUTDOWN_CLASS = next(v for v in vars(shutdown).values() if isinstance(v, type)
 async def test_startup_only_quiet_option(quiet):
     cfg = PlatformConfig(enabled=True, extra={'gateway_startup_notification': not quiet})
     home = NS(chat_id='fixture-home', thread_id=None)
-    owner = NS(_home_channel_transports=lambda: [(Platform.DISCORD, cfg, home, NS())],
+    owner = NS(_served_home_channel_transports=lambda: [('default', Platform.DISCORD, cfg, home, NS())],
                _send_home_channel_message=AsyncMock(return_value=True))
     result = await NOTICE_CLASS._send_home_channel_startup_notifications(owner)
     assert owner._send_home_channel_message.await_count == (0 if quiet else 1)
