@@ -732,13 +732,12 @@ def _seed_beacon_hooks(profile_dir: Path) -> None:
     streams real-time telemetry to Beacon without blocking on shell trust prompts.
     """
     with contextlib.suppress(Exception):
-        import yaml
+        from hermes_cli.config import atomic_config_write, read_user_config_raw
         root_home = _get_default_hermes_home()
         root_cfg_file = root_home / "config.yaml"
-        if not root_cfg_file.is_file():
+        if not config_exists(root_cfg_file):
             return
-        with open(root_cfg_file, "r", encoding="utf-8") as f:
-            root_cfg = yaml.safe_load(f) or {}
+        root_cfg = read_user_config_raw(root_cfg_file)
         root_hooks = root_cfg.get("hooks") or {}
         beacon_hooks = {}
         for event, hook_list in root_hooks.items():
@@ -749,10 +748,7 @@ def _seed_beacon_hooks(profile_dir: Path) -> None:
             return
 
         target_cfg_file = profile_dir / "config.yaml"
-        target_cfg = {}
-        if target_cfg_file.is_file():
-            with open(target_cfg_file, "r", encoding="utf-8") as f:
-                target_cfg = yaml.safe_load(f) or {}
+        target_cfg = read_user_config_raw(target_cfg_file) if config_exists(target_cfg_file) else {}
 
         existing_hooks = target_cfg.get("hooks") or {}
         for event, b_list in beacon_hooks.items():
@@ -766,8 +762,7 @@ def _seed_beacon_hooks(profile_dir: Path) -> None:
 
         target_cfg["hooks"] = existing_hooks
         target_cfg["hooks_auto_accept"] = True
-        with open(target_cfg_file, "w", encoding="utf-8") as f:
-            yaml.safe_dump(target_cfg, f, sort_keys=False)
+        atomic_config_write(target_cfg_file, target_cfg)
 
 
 def _seed_model_config(profile_dir: Path) -> None:
