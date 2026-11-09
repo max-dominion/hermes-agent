@@ -107,6 +107,21 @@ def make_new_tab(new_tab: Callable[..., Any], cdp: Callable[..., Any],
     return new_tab_in_front
 
 
+def make_recording_new_tab(new_tab: Callable[..., Any], ledger: str) -> Callable[..., Any]:
+    """Append each tab ``new_tab`` opens to ``ledger`` so Hermes closes it at task cleanup (the
+    browser is shared and outlives the task: tools/browser_use_tabs.py)."""
+    def new_tab_recorded(url="about:blank"):
+        tid = new_tab(url)
+        if tid:
+            try:
+                with open(ledger, "a", encoding="utf-8") as f:
+                    f.write(f"{tid}\n")
+            except OSError as e:
+                _log.warning("new_tab: could not record tab for cleanup: %s", e)
+        return tid
+    return new_tab_recorded
+
+
 def _is_harness_helper(fn: Any) -> bool:
     """True for the harness's own helper; a same-named function from the agent's workspace
     ``agent_helpers.py`` (loaded into the helpers module at import) is the agent's choice."""
@@ -143,8 +158,12 @@ def install(helpers: Any, activate: str = ACTIVATE_NEVER) -> None:
     if _is_harness_helper(helpers.capture_screenshot):
         helpers.capture_screenshot = make_capture_screenshot(helpers.cdp, helpers.current_tab,
                                                              activate_hidden=check)
-    if activate != ACTIVATE_NEVER and _is_harness_helper(helpers.new_tab):
+    harness_new_tab = _is_harness_helper(helpers.new_tab)
+    if activate != ACTIVATE_NEVER and harness_new_tab:
         helpers.new_tab = make_new_tab(helpers.new_tab, helpers.cdp, activate=check)
+    ledger = os.environ.get("BH_HERMES_TAB_LEDGER")
+    if ledger and harness_new_tab:
+        helpers.new_tab = make_recording_new_tab(helpers.new_tab, ledger)
 
 
 _HARNESS_MODULE_ARGS = ["-m", "browser_harness.run"]

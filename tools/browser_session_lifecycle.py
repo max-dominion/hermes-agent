@@ -173,6 +173,11 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if not keys:
         _forget_session_tracking(task)
 
+    def _release_shared_tabs():  # a shared (CDP override) browser has no session entry above
+        from tools.browser_use_cli import stop_task_harness_daemons
+        stop_task_harness_daemons(task_id)
+    _best_effort("Shared-browser tab release", _release_shared_tabs)
+
 
 def cleanup_profile_browsers(home_key: str) -> None:
     """Close one profile home's sessions, CDP supervisors and harness daemons, and drop its cached config

@@ -28,6 +28,7 @@ from hermes_cli.process_identity import (
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.browser_harness_dirs import (daemon_env, daemon_identity, fit_default_socket_dir, harness_pid_file,
                                         namespace_harness_dirs)
+from tools import browser_use_tabs
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ def _hermes_ensure_own_tab():
         _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
         if _tid:
             switch_tab(_tid)
+            _ledger = _os.environ.get("BH_HERMES_TAB_LEDGER")
+            if _ledger:  # closed at task cleanup (tools/browser_use_tabs.py)
+                with open(_ledger, "a") as _f:
+                    _f.write(_tid + "\\n")
     except Exception:
         pass  # best-effort: worst case is pre-fix behavior
     try:
@@ -660,12 +665,37 @@ def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with i
         return
     env = _base_subprocess_env()
     for daemon in daemons:
+        # Tabs it opened on a shared browser go first: the browser outlives the daemon.
+        _quiet(lambda: browser_use_tabs.release_daemon_tabs(daemon, daemon_env(env, daemon)), None,
+               "browser_exec tab release failed")
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             _run_cli_killing_process_group([*cmd, "--reload"], "", daemon_env(env, daemon), 15)
         with _owned_daemon_groups_lock:
             pgid = _owned_daemon_groups.pop(daemon, None)
         if pgid is not None:
             release_process_group_once_empty(pgid)  # a daemon --reload failed to stop stays covered
+
+
+def stop_task_harness_daemons(task_id: Optional[str]) -> None:
+    """Task cleanup on a SHARED browser: close the tabs ``task_id`` opened there and stop the harness
+    daemons no other task still drives. Without this they outlived the task forever (2026-11-09 OOM)."""
+    daemons = browser_use_tabs.daemons_of_task(task_id)
+    if not daemons:
+        return
+    env = _base_subprocess_env()
+    stop = []
+    for daemon in daemons:
+        denv = daemon_env(env, daemon)
+        idle = browser_use_tabs.is_daemon_idle_after(daemon, task_id)
+        browser_use_tabs.release_daemon_tabs(daemon, denv, task_id)
+        pid = _published_daemon_pid(denv)
+        # Stop only a daemon this process started: another Hermes may be mid-call on a shared name.
+        if idle and pid is not None and spawned_by_this_process(pid):
+            stop.append(daemon)
+    with _driven_daemons_lock:
+        for daemon in stop:
+            _driven_daemons.pop(daemon, None)
+    _reload_daemons(stop)
 
 
 # Daemon identity (``daemon_identity``: its dirs + BU_NAME) -> process group of the harness daemon this
@@ -817,6 +847,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
+    shared_cdp = None if private_browser else (env.get("BU_CDP_WS") or env.get("BU_CDP_URL"))
+    if shared_cdp:  # tabs this task opens there are closed at its cleanup
+        browser_use_tabs.register_call(env, daemon_identity(env), task_id, shared_cdp)
     # Every backend: capture_screenshot() falls back to jpeg instead of hanging on a png a hidden tab never
     # renders; only on a cloud browser does it (and new_tab) bring the tab to the front (tools/browser_use_shot.py).
     from tools.browser_use_shot import ACTIVATE_NEVER, harness_command
