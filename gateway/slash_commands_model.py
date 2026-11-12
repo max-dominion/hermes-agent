@@ -464,6 +464,18 @@ class GatewayModelCommandsMixin:
                 persist_global=ctx.persist_global and global_error is None)
         return reply + ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
 
+    def _model_callback_scope(self, profile_home):
+        """Scope for a /model switch fired from an adapter callback (picker pick, offer tap).
+
+        The adapter runs the callback in its own interaction task, outside the message handler's
+        scope. A routed profile re-enters its home. A standalone gateway re-enters the launch
+        profile's own scope, as its turns do (``_standalone_launch_scope``): once the process-wide
+        guard is armed, an unscoped credential read raises ``UnscopedSecretError``."""
+        if profile_home is not None:
+            from gateway.run import _profile_runtime_scope
+            return _profile_runtime_scope(profile_home)
+        return self._standalone_launch_scope()
+
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
         is session-key-normalized so the picker's thread metadata lands where the next turn reads."""
@@ -511,10 +523,7 @@ class GatewayModelCommandsMixin:
                 return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
 
             async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
-                if profile_home is None:
-                    return await _picker_switch(model_id, provider_slug)
-                from gateway.run import _profile_runtime_scope
-                with _profile_runtime_scope(profile_home):
+                with self._model_callback_scope(profile_home):
                     return await _picker_switch(model_id, provider_slug)
 
             if await self._send_model_picker(event, ctx.source, adapter, ctx.session_key, listing_kwargs, _on_model_selected):
@@ -773,12 +782,8 @@ class GatewayModelCommandsMixin:
             return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
 
         before = self._session_model_overrides.get(session_key)
-        if profile_home is None:
+        with self._model_callback_scope(profile_home):
             reply = await _switch()
-        else:
-            from gateway.run import _profile_runtime_scope
-            with _profile_runtime_scope(profile_home):
-                reply = await _switch()
         after = self._session_model_overrides.get(session_key)
         switched = after is not None and after is not before and after.get("provider") == "nous"
         if switched:

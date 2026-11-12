@@ -1428,8 +1428,10 @@ def _anthropic_catalog(normalized: str, force_refresh: bool) -> list[str]:
         # A placeholder for the outage, not this account/proxy's catalog: the disk cache must
         # never pin it over a same-credentials live row (#107391).
         return CuratedFallbackModels(curated)
-    # The live /v1/models dump lags newly-routed curated aliases (reachable before enumerated):
-    # curated first, then live-only extras, so a fresh curated model never disappears.
+    # The live /v1/models dump lags newly-routed curated aliases: curated first, then live-only extras.
+    # A dotted curated alias takes its live wire id (claude-fable-5.1 -> claude-fable-5-1), never both.
+    from agent.anthropic_message_convert import normalize_model_name as _wire
+    curated = [_wire(m) if _wire(m).lower() in {x.lower() for x in live} else m for m in curated]
     return live if cfg_base_url else _merge_unique(curated, live)
 
 
@@ -1942,12 +1944,9 @@ def _credential_fingerprint(provider: str) -> str:
         from hermes_cli.codex_models import codex_catalog_credential_identity
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
     else:
-        try:
-            from hermes_constants import get_hermes_home
-            for rel in ("auth.json", "credentials.json"):
-                _mtime_part(rel, get_hermes_home() / rel)
-        except Exception:
-            pass
+        from hermes_cli.models_cache_fingerprint import auth_store_identity, home_auth_file
+        parts.append(f"auth.json#{auth_store_identity(home_auth_file(), provider)}")  # this provider's slice
+        _mtime_part("credentials.json", home_auth_file().with_name("credentials.json"))
         from providers import list_providers
         profile_files = [rel for profile in list_providers() for rel in profile.catalog_credential_files]
         for rel in ("~/.codex/auth.json", "~/.claude/.credentials.json", *profile_files, "~/.minimax/credentials.json"):
