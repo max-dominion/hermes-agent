@@ -44,6 +44,22 @@ def _pool_identity(entries: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def profile_env_value(name: str) -> str:
+    """The value this profile configures for env var *name*, the same in every process on the home.
+
+    The catalog cache is one file per home, shared by the gateway and every Hermes child on it. The
+    terminal and cron sanitizers scrub provider keys from a child's ``os.environ``, so a key read only
+    from ``os.environ`` split one profile's row into two cache keys: the child's write evicted the
+    gateway's row and the next picker open showed the curated list (no ``claude-fable-5-2``). Read the
+    bound profile scope, then ``os.environ``, then the home's own ``.env``."""
+    from agent.secret_scope import UnscopedSecretError, get_secret, load_env_file
+    try:
+        value = get_secret(name)
+    except UnscopedSecretError:  # an unbound multiplex read: this home's .env, never another profile's
+        value = None
+    return value or load_env_file(home_auth_file().with_name(".env")).get(name, "")
+
+
 def home_auth_file() -> Path:
     """The active profile's ``auth.json`` (resolved per call: one process serves several homes)."""
     from hermes_constants import get_hermes_home

@@ -1870,16 +1870,17 @@ def _credential_fingerprint(provider: str) -> str:
     """
     import hashlib
 
+    from hermes_cli.models_cache_fingerprint import auth_store_identity, home_auth_file, profile_env_value
     parts: list[str] = []
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
         pcfg = PROVIDER_REGISTRY.get(provider)
-        if pcfg is not None:
+        if pcfg is not None:  # values via the profile, not os.environ: Hermes children run with keys scrubbed
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={os.environ.get(ev, '')}")
+                parts.append(f"{ev}={profile_env_value(ev)}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={os.environ.get(bev, '')}")
+                parts.append(f"{bev}={profile_env_value(bev)}")
     except Exception:
         pass
 
@@ -1891,7 +1892,7 @@ def _credential_fingerprint(provider: str) -> str:
         if profile is not None and profile.auth_type == "external_process":
             for ev in (*profile.process_command_env_vars, profile.process_args_env_var):
                 if ev:
-                    parts.append(f"{ev}={os.environ.get(ev, '')}")
+                    parts.append(f"{ev}={profile_env_value(ev)}")
     except Exception:
         pass
 
@@ -1944,7 +1945,6 @@ def _credential_fingerprint(provider: str) -> str:
         from hermes_cli.codex_models import codex_catalog_credential_identity
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
     else:
-        from hermes_cli.models_cache_fingerprint import auth_store_identity, home_auth_file
         parts.append(f"auth.json#{auth_store_identity(home_auth_file(), provider)}")  # this provider's slice
         _mtime_part("credentials.json", home_auth_file().with_name("credentials.json"))
         from providers import list_providers
